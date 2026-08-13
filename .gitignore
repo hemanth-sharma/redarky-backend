@@ -1,0 +1,105 @@
+# --- Project Specific Data (IMPORTANT) ---
+redarky_data/
+redarky/redarky_data/
+redarky/redarky_data_s3/
+redarky_data_s3/
+*.json
+
+# --- Python / FastAPI ---
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+venv/
+airflow_venv/
+ENV/
+.env
+.env*
+.pytest_cache/
+
+# --- Alembic ---
+# We keep the .py files in versions, but ignore the cache
+redarky/api/alembic/__pycache__/
+
+# --- Go ---
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+redarky/scraper/bin/
+
+# --- Database / Storage ---
+*.sqlite
+*.sqlite-journal
+*.log
+
+# --- IDEs / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# --- Miscellaneous ---
+ProjectPlanChatGPT.txt
+vantage_project_plan.docx
+redarky_project_plan.docx
+redarky_project_plan*
+rough*
+.env
+.env*
+
+node_modules/
+# ==========================================
+# Apache Airflow Local Runtime Artifacts
+# ==========================================
+
+# Ignore SQLite database files generated at runtime
+redarky/airflow/*.db
+redarky/airflow/*.db-shm
+redarky/airflow/*.db-wal
+
+# Ignore all runtime logs and execution telemetry
+redarky/airflow/logs/
+
+# Ignore Airflow PID files and webserver/api state trackers
+redarky/airflow/*.pid
+redarky/airflow/*.cfg
+redarky/airflow/webserver_config.py
+
+# Ignore automatically generated credential files or secrets
+redarky/airflow/*.json.generated
+redarky/airflow/*.json
+
+# Ignore local virtual environments if located inside the airflow directory
+redarky/airflow/.venv/
+redarky/airflow/venv/
+
+
+
+
+# Ignore SQLite database files generated at runtime
+redarky/pipeline/*.db
+redarky/pipeline/*.db-shm
+redarky/pipeline/*.db-wal
+
+# Ignore all runtime logs and execution telemetry
+redarky/pipeline/logs/
+
+# Ignore Airflow PID files and webserver/api state trackers
+redarky/pipeline/*.pid
+redarky/pipeline/*.cfg
+redarky/pipeline/webserver_config.py
+
+# Ignore automatically generated credential files or secrets
+redarky/pipeline/*.json.generated
+redarky/pipeline/*.json
+
+# Ignore local virtual environments if located inside the pipeline directory
+redarky/pipeline/.venv/
+redarky/pipeline/venv/
+
