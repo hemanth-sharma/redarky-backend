@@ -1,3 +1,6 @@
+"""
+app/database.py
+"""
 from collections.abc import AsyncIterator
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -10,7 +13,7 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_async_engine(settings.DATABASE_URL, future=True)
+engine = create_async_engine(settings.DATABASE_URL, future=True, pool_pre_ping=True)
 SessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,

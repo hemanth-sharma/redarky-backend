@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"redarky/internal/models"
 
@@ -19,6 +18,9 @@ import (
 
 const OAuthBaseURL = "https://oauth.reddit.com"
 
+// Client wraps a TLS-fingerprinted http client and a TokenManager.
+// The TLS profile (Chrome_124) and noop-logger setup are unchanged from
+// the original — this is the surface that makes Reddit see us as a browser.
 type Client struct {
 	tokenMgr   *TokenManager
 	httpClient tls_client.HttpClient
@@ -41,71 +43,143 @@ func NewClient(tm *TokenManager) *Client {
 	}
 }
 
+// redditListing is the JSON envelope returned by Reddit's listing endpoints.
+// Field set is the union of what /search.json and /r/{sub}/{sort}.json return.
 type redditListing struct {
 	Data struct {
 		Children []struct {
-			Kind string `json:"kind"`
+			Kind string `json:"kind"` // "t3" = post, "t1" = comment
 			Data struct {
-				ID         string  `json:"id"`
-				Name       string  `json:"name"`
-				Title      string  `json:"title"`
-				Selftext   string  `json:"selftext"`
-				Body       string  `json:"body"`
-				URL        string  `json:"url"`
-				Permalink  string  `json:"permalink"`
-				Author     string  `json:"author"`
-				Score      int     `json:"score"`
-				Subreddit  string  `json:"subreddit"`
-				CreatedUtc float64 `json:"created_utc"`
-				IsSelf     bool    `json:"is_self"`
+				ID          string  `json:"id"`
+				Name        string  `json:"name"` // Fullname e.g. "t3_abc123"
+				Title       string  `json:"title"`
+				Selftext    string  `json:"selftext"`
+				Body        string  `json:"body"`
+				URL         string  `json:"url"`
+				Permalink   string  `json:"permalink"`
+				Author      string  `json:"author"`
+				Score       int     `json:"score"`
+				NumComments int     `json:"num_comments"`
+				Subreddit   string  `json:"subreddit"`
+				CreatedUtc  float64 `json:"created_utc"`
+				IsSelf      bool    `json:"is_self"`
 			} `json:"data"`
 		} `json:"children"`
 	} `json:"data"`
 }
 
-func (c *Client) FetchSearchBatch(query string, subreddit string, since int64, before string, mode models.ScrapeMode, excludeKeywords []string) ([]models.ScrapedItem, error) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Public fetch methods
+//
+// Two distinct entry points now exist (was one combined method):
+//
+//   FetchSearchBatch    — global Reddit search for a single keyword.
+//   FetchSubredditBatch — latest posts from a single subreddit (no keyword).
+//
+// Both go through the shared doRedditRequest() which preserves the original
+// TLS / header / rate-limit / circuit-breaker behaviour byte-for-byte.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// FetchSearchBatch does a GLOBAL Reddit search (no subreddit restriction)
+// for a single keyword.
+//
+//	query            — the keyword to search for
+//	sort             — "new" | "hot" | "top" (empty → "new")
+//	sinceTimestamp    — Unix epoch cutoff; older posts are dropped (nil = no cutoff)
+//	includeComments  — when true, the request omits `type=link` so Reddit
+//	                    may also return t1 (comment) results
+func (c *Client) FetchSearchBatch(query, sort string, sinceTimestamp *int64, includeComments bool) ([]models.ScrapedItem, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, fmt.Errorf("empty query")
+	}
+
 	sess, err := c.tokenMgr.GetSession()
 	if err != nil {
 		return nil, fmt.Errorf("session error: %w", err)
 	}
 
-	sortParam := "new"
-	timeParam := "day"
-	if mode == models.ModeBackfill {
-		sortParam = "relevance"
-		timeParam = "month"
+	if sort == "" {
+		sort = "new"
 	}
 
-	var rawURL string
-	if subreddit != "" {
-		rawURL = fmt.Sprintf(
-			"%s/r/%s/search.json?q=%s&restrict_sr=1&sort=%s&t=%s&limit=100&raw_json=1",
-			OAuthBaseURL,
-			url.PathEscape(subreddit),
-			url.QueryEscape(query),
-			sortParam,
-			timeParam,
-		)
-	} else {
-		rawURL = fmt.Sprintf(
-			"%s/search.json?q=%s&sort=%s&t=%s&limit=100&raw_json=1",
-			OAuthBaseURL,
-			url.QueryEscape(query),
-			sortParam,
-			timeParam,
-		)
+	// Build the URL. `t=day` matches the original "live" mode — fresh posts
+	// only, which is what we want for high-intent lead detection.
+	//
+	// `type` param: Reddit accepts "link" (posts), "comment", or "sr".
+	// To get BOTH posts and comments, OMIT the type param entirely (default
+	// is "all"). When includeComments=false, we explicitly set type=link.
+	q := url.Values{}
+	q.Set("q", query)
+	q.Set("sort", sort)
+	q.Set("t", "day")
+	q.Set("limit", "100")
+	q.Set("raw_json", "1")
+	if !includeComments {
+		q.Set("type", "link")
+	}
+	rawURL := fmt.Sprintf("%s/search.json?%s", OAuthBaseURL, q.Encode())
+
+	return c.doRedditRequest(rawURL, sess, sinceTimestamp)
+}
+
+// FetchSubredditBatch pulls the latest posts from a single subreddit
+// (no keyword filter). Used for high-precision sources where we want
+// everything posted in r/SaaS, r/productivity, etc.
+//
+//	subreddit       — name without r/ prefix (will be stripped if present)
+//	sort            — "new" | "hot" | "top" (empty → "new")
+//	sinceTimestamp  — Unix epoch cutoff; older posts are dropped (nil = no cutoff)
+//
+// Note: subreddit pulls always return posts (t3) only. To get comments you
+// would need a separate /comments/{post_id} call per post — out of scope for MVP.
+func (c *Client) FetchSubredditBatch(subreddit, sort string, sinceTimestamp *int64) ([]models.ScrapedItem, error) {
+	subreddit = strings.TrimSpace(subreddit)
+	if subreddit == "" {
+		return nil, fmt.Errorf("empty subreddit")
+	}
+	// Be forgiving about r/ prefix
+	subreddit = strings.TrimPrefix(subreddit, "r/")
+
+	sess, err := c.tokenMgr.GetSession()
+	if err != nil {
+		return nil, fmt.Errorf("session error: %w", err)
 	}
 
-	if before != "" {
-		rawURL += "&before=" + url.QueryEscape(before)
+	if sort == "" {
+		sort = "new"
 	}
 
+	q := url.Values{}
+	q.Set("limit", "100")
+	q.Set("raw_json", "1")
+	rawURL := fmt.Sprintf(
+		"%s/r/%s/%s.json?%s",
+		OAuthBaseURL,
+		url.PathEscape(subreddit),
+		url.PathEscape(sort),
+		q.Encode(),
+	)
+
+	return c.doRedditRequest(rawURL, sess, sinceTimestamp)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared HTTP + parse — preserves original TLS-fingerprint surface.
+//
+// Every header below (Authorization, User-Agent, X-Reddit-Device-Id,
+// client-vendor-id, x-reddit-retry, x-reddit-compression, x-reddit-qos,
+// x-reddit-media-codecs, x-reddit-loid, x-reddit-session, Cookie) is
+// required for Reddit to identify the request as a Chrome-124 Android
+// client. Do NOT remove or reorder headers without testing against
+// production Reddit — even header ORDER matters for the TLS fingerprint.
+// ─────────────────────────────────────────────────────────────────────────────
+func (c *Client) doRedditRequest(rawURL string, sess *Session, sinceTimestamp *int64) ([]models.ScrapedItem, error) {
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// Set headers cleanly on fhttp.Request
+	// ── Headers (unchanged from original — TLS-fingerprint surface) ──
 	req.Header.Set("Authorization", "Bearer "+sess.AccessToken)
 	req.Header.Set("User-Agent", sess.UserAgent)
 	req.Header.Set("X-Reddit-Device-Id", sess.DeviceID)
@@ -134,13 +208,16 @@ func (c *Client) FetchSearchBatch(query string, subreddit string, since int64, b
 	}
 	defer resp.Body.Close()
 
+	// ── Rate-limit accounting (unchanged) ──
 	if remStr := resp.Header.Get("x-ratelimit-remaining"); remStr != "" {
 		if remVal, err := strconv.ParseFloat(remStr, 64); err == nil {
 			c.tokenMgr.UpdateRateLimit(remVal)
 		}
 	}
 
-	if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode == http.StatusForbidden && resp.Header.Get("Retry-After") != "") {
+	// ── Rate-limit / 403-with-Retry-After handling (unchanged) ──
+	if resp.StatusCode == http.StatusTooManyRequests ||
+		(resp.StatusCode == http.StatusForbidden && resp.Header.Get("Retry-After") != "") {
 		log.Printf("[REDDIT RATE LIMIT] Status %d encountered. Forcing token rotation.", resp.StatusCode)
 		_ = c.tokenMgr.ForceRefreshToken()
 		return nil, fmt.Errorf("reddit rate limit hit (HTTP %d)", resp.StatusCode)
@@ -156,30 +233,37 @@ func (c *Client) FetchSearchBatch(query string, subreddit string, since int64, b
 		return nil, fmt.Errorf("JSON decode error: %w", err)
 	}
 
-	now := time.Now().Format(time.RFC3339)
+	return parseListing(&listing, sinceTimestamp), nil
+}
+
+// parseListing extracts ScrapedItems from a Reddit listing, applying the
+// sinceTimestamp cutoff and skipping deleted/removed posts.
+//
+// This was previously inline in FetchSearchBatch; pulled out so both
+// FetchSearchBatch and FetchSubredditBatch can share it.
+func parseListing(listing *redditListing, sinceTimestamp *int64) []models.ScrapedItem {
 	results := make([]models.ScrapedItem, 0, len(listing.Data.Children))
 
 	for _, child := range listing.Data.Children {
 		d := child.Data
 
-		if int64(d.CreatedUtc) < since {
+		// Time cutoff (only if caller provided one)
+		if sinceTimestamp != nil && int64(d.CreatedUtc) < *sinceTimestamp {
 			continue
 		}
 
-		textToCheck := strings.ToLower(d.Title + " " + d.Selftext + " " + d.Body)
-		if containsAny(textToCheck, excludeKeywords) {
-			continue
-		}
-
+		// Skip deleted / removed
 		if d.Author == "[deleted]" || d.Selftext == "[removed]" {
 			continue
 		}
 
+		// Build the post URL
 		postURL := d.URL
 		if d.IsSelf || d.Permalink != "" {
 			postURL = "https://www.reddit.com" + d.Permalink
 		}
 
+		// Posts (t3) vs comments (t1) have different field semantics
 		postType := "post"
 		content := d.Selftext
 		title := d.Title
@@ -190,29 +274,22 @@ func (c *Client) FetchSearchBatch(query string, subreddit string, since int64, b
 			postURL = "https://www.reddit.com" + d.Permalink
 		}
 
+		createdUtc := int64(d.CreatedUtc)
+
 		results = append(results, models.ScrapedItem{
-			Source:     "reddit",
-			ExternalID: d.Name,
-			Title:      title,
-			Content:    content,
-			URL:        postURL,
-			Author:     d.Author,
-			Score:      d.Score,
-			Subreddit:  d.Subreddit,
-			PostType:   postType,
-			CreatedAt:  int64(d.CreatedUtc),
-			ScrapedAt:  now,
+			Source:            "reddit",
+			ExternalID:        d.Name,
+			Title:             title,
+			Content:           content,
+			URL:               postURL,
+			Author:            d.Author,
+			Score:             d.Score,
+			CommentsCount:     d.NumComments,
+			Subreddit:         d.Subreddit,
+			PostType:          postType,
+			CreatedAtPlatform: &createdUtc,
 		})
 	}
 
-	return results, nil
-}
-
-func containsAny(text string, keywords []string) bool {
-	for _, kw := range keywords {
-		if kw != "" && strings.Contains(text, strings.ToLower(kw)) {
-			return true
-		}
-	}
-	return false
+	return results
 }

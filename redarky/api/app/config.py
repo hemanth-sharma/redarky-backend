@@ -14,6 +14,21 @@ class Settings(BaseSettings):
     # AI services (Stage 3)
     OPENAI_API_KEY: str = ""
 
+    EMBEDDING_MODEL_ENABLED: bool = False
+    EMBEDDING_MODEL_NAME: str = "all-MiniLM-L6-v2"
+    
+    LLM_ENABLED: bool = False
+    LLM_API_URL: str = "https://api.openai.com/v1/chat/completions"
+    LLM_API_KEY: str = ""
+    LLM_MODEL_NAME: str = "gpt-4o-mini"
+
+    # Celery beat sechedule
+    SCRAPER_INTERVAL_MINUTES: int = 30
+    CLEANUP_INTERVAL_HOURS: int = 24
+
+    # Ingestion webhook shared secret
+    INGESTION_WEBHOOK_SECRET: str = "change-it-in-production"
+
     # Apify
     APIFY_API_TOKEN: str
     APIFY_WEBHOOK_SECRET: str

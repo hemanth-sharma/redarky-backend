@@ -1,88 +1,88 @@
 """
-app/sources/models.py + app/sources/service.py
+app/sources/models.py
 
-monitored_sources: global registry of subreddits being scraped.
-project_sources: join table linking projects to their watched subreddits.
+Targets domain — Monitored Sources (global registry of subreddits / accounts).
 
-The subscriber_count pattern is what keeps scraping costs proportional
-to unique sources, not to user count.
+KEY CONCEPT: This is a GLOBAL registry, NOT per-user.
+When user A adds r/SaaS and user B adds r/SaaS, only ONE row exists in
+monitored_sources. Both projects link to it via project_sources.
+
+This is what enables shared scraping: the Go scraper pulls r/SaaS once,
+and the matching engine distributes the RawPosts to every project that
+subscribed to it. Saves API quota dramatically.
+
+No Apify coupling — source_type is generic ("reddit" | "x" | "linkedin").
+Scheduling is handled by Celery Beat calling the Go scraper directly.
 """
-
-import uuid
-import logging
 from datetime import datetime
-from typing import Optional
+from uuid import uuid4
 
-from sqlalchemy import String, Integer, Boolean, DateTime, ForeignKey, UniqueConstraint, select, and_
+from sqlalchemy import String, Integer, Boolean, DateTime, ForeignKey, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import Base
-from app.apify.scheduler import (
-    create_subreddit_schedule,
-    pause_subreddit_schedule,
-    resume_subreddit_schedule,
-    trigger_immediate_run,
-)
 
-logger = logging.getLogger("uvicorn.sources")
-
-
-# ── Models ─────────────────────────────────────────────────────────────────────
 
 class MonitoredSource(Base):
     """
-    One row per unique (source_type, identifier) combination being actively scraped.
-    e.g. ("reddit", "forhire"), ("reddit", "devops"), ("hn", "frontpage")
+    Global registry of subreddits / accounts / pages we scrape.
 
-    Shared across all users. 1000 users watching r/forhire = 1 row here.
+    `subscriber_count` is the number of projects watching this source.
+    When it hits 0, `is_active` is flipped to False — Celery Beat will
+    skip it when building the scraper payload, saving API calls.
     """
     __tablename__ = "monitored_sources"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    source_type: Mapped[str] = mapped_column(String(32), nullable=False)        # "reddit" | "hn"
-    identifier: Mapped[str] = mapped_column(String(255), nullable=False)        # subreddit name | "frontpage"
-    interval_minutes: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
-    subscriber_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    # Number of active projects watching this source.
-    # When this hits 0, we pause the Apify schedule to stop paying for it.
-
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    apify_schedule_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    # The Apify schedule ID so we can pause/resume it programmatically.
-
-    last_scraped_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-
     __table_args__ = (
-        UniqueConstraint("source_type", "identifier", name="uq_monitored_source"),
+        UniqueConstraint("source_type", "identifier", name="uq_sources_type_identifier"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    # "reddit" | "x" | "linkedin" | ...
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    # "r/SaaS" | "@elonmusk" | ...
+    identifier: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+
+    # How many projects are watching this? Drives the auto-pause logic.
+    subscriber_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # How often (minutes) Celery Beat should include this in a batch.
+    # Default 30 min — Reddit rate-limit friendly.
+    interval_minutes: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
+
+    last_scraped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 
 class ProjectSource(Base):
     """
-    Join table: which subreddits (monitored_sources) does each project watch?
-    When a user adds r/forhire to their project, we add a row here and
-    increment monitored_sources.subscriber_count.
+    Join table: which projects are watching which sources?
+
+    When a user adds r/SaaS to their project:
+      1. Look up (or create) the MonitoredSource row
+      2. Create a ProjectSource link
+      3. Increment monitored_sources.subscriber_count
+      4. If subscriber_count went 0 → 1, flip is_active=True
     """
     __tablename__ = "project_sources"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    monitored_source_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("monitored_sources.id", ondelete="CASCADE"), nullable=False
-    )
-    source_identifier: Mapped[str] = mapped_column(String(255), nullable=False)
-    # Denormalised copy of monitored_sources.identifier for fast keyword matching queries.
-    # Avoids a join in the hot matching path.
-
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-
     __table_args__ = (
-        UniqueConstraint("project_id", "monitored_source_id", name="uq_project_source"),
+        UniqueConstraint("project_id", "monitored_source_id", name="uq_project_sources"),
     )
 
+    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    monitored_source_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("monitored_sources.id", ondelete="CASCADE"),
+        nullable=False, index=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -1,40 +1,37 @@
 """
 app/keywords/models.py
 
-Added BRAND keyword type alongside existing INCLUDE / EXCLUDE.
+Targets domain — Keywords.
 
-Brand keywords work exactly like include keywords in terms of scraping,
-but are tagged is_brand_mention=True on the resulting Post/Lead records.
-This lets the frontend show a "Brand mention" badge separately from
-"Intent lead" results.
+A Keyword belongs to exactly one Project. The matching engine uses:
+  - "include" → post must contain this (or be semantically close)
+  - "exclude" → post is filtered out if it contains this
+  - "brand"   → post is flagged as a brand mention if it contains this
 """
-
-import uuid
-import enum
 from datetime import datetime
-from sqlalchemy import String, DateTime, ForeignKey, Enum as SAEnum
+from uuid import uuid4
+
+from sqlalchemy import String, DateTime, ForeignKey, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
+
 from app.database import Base
-
-
-class KeywordType(enum.StrEnum):
-    INCLUDE = "include"   # trigger scraping, not a brand mention
-    EXCLUDE = "exclude"   # filter out posts containing these (client-side)
-    BRAND   = "brand"     # like include, but tagged is_brand_mention=True
 
 
 class Keyword(Base):
     __tablename__ = "keywords"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    __table_args__ = (
+        # Prevent duplicate (project_id, keyword) pairs
+        UniqueConstraint("project_id", "keyword", name="uq_keywords_project_keyword"),
     )
-    keyword: Mapped[str] = mapped_column(String(512), nullable=False)
-    keyword_type: Mapped[KeywordType] = mapped_column(
-        SAEnum(KeywordType, name="keyword_type_enum"), nullable=False, default=KeywordType.INCLUDE
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
-    project: Mapped["Project"] = relationship("Project", back_populates="keywords")
+    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    keyword: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # Enum: "include" | "exclude" | "brand"
+    keyword_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

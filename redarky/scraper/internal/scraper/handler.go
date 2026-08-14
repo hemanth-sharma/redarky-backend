@@ -3,10 +3,8 @@ package scraper
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +15,14 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Globals — initialised once at process start.
+//
+// The rate limiter and circuit breaker below are UNCHANGED from the original
+// implementation. They protect the Reddit OAuth surface from getting us
+// IP-banned: 1 request per 500ms with burst of 5, and trips open after 4
+// consecutive failures.
+// ─────────────────────────────────────────────────────────────────────────────
 var (
 	redditLimiter = rate.NewLimiter(rate.Every(500*time.Millisecond), 5)
 
@@ -43,17 +49,45 @@ func init() {
 	redditClient = reddit.NewClient(tokenManager)
 }
 
-type fetchBatchJob struct {
-	combinedQuery string
-	subreddit     string
+// ─────────────────────────────────────────────────────────────────────────────
+// Job model
+//
+// Two distinct job kinds now (was one combined "query + subreddit" job):
+//
+//	kind="keyword"   → FetchSearchBatch    (global Reddit search)
+//	kind="subreddit" → FetchSubredditBatch (latest posts from r/X)
+//
+// This mirrors the new ScraperPayload contract where keywords and subreddits
+// are independent lists — no cross-product fan-out (one job per keyword,
+// one job per subreddit, full stop).
+// ─────────────────────────────────────────────────────────────────────────────
+type batchJob struct {
+	kind      string // "keyword" | "subreddit"
+	query     string // populated when kind == "keyword"
+	subreddit string // populated when kind == "subreddit"
 }
 
 type jobResult struct {
 	items []models.ScrapedItem
 	err   error
-	job   fetchBatchJob
+	job   batchJob
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// HandleScrape — POST /scrape
+//
+// Flow:
+//  1. Decode ScrapeRequest (new payload shape from FastAPI).
+//  2. Build N jobs (one per keyword + one per subreddit).
+//  3. Fan out concurrently through the rate limiter + circuit breaker.
+//  4. Dedup items by ExternalID (same post can appear in both a keyword
+//     search AND a subreddit pull — keep the first occurrence).
+//  5. Return ScrapeResult.
+//
+// NOTE: keyword matching, brand-mention detection, and exclude-keyword
+// filtering used to happen here in v1. They now happen on the Python side
+// (Stage 1 of the 3-stage matching pipeline). Go just returns raw items.
+// ─────────────────────────────────────────────────────────────────────────────
 func HandleScrape(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -66,23 +100,23 @@ func HandleScrape(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.IncludeKeywords) == 0 && len(req.BrandKeywords) == 0 {
-		http.Error(w, "at least one keyword required", http.StatusBadRequest)
+	if len(req.Keywords) == 0 && len(req.Subreddits) == 0 {
+		http.Error(w, "at least one keyword or subreddit required", http.StatusBadRequest)
 		return
 	}
 
-	batchJobs := buildBatchJobs(&req)
+	jobs := buildBatchJobs(&req)
+	resultsCh := make(chan jobResult, len(jobs))
 
-	resultsCh := make(chan jobResult, len(batchJobs))
 	var wg sync.WaitGroup
-
-	for _, job := range batchJobs {
+	for _, job := range jobs {
 		wg.Add(1)
-		go func(j fetchBatchJob) {
+		go func(j batchJob) {
 			defer wg.Done()
 			items, err := executeRedditBatch(j, &req)
 			if err != nil {
-				log.Printf("[SCRAPER ERROR] Query: %q | Subreddit: %q | Err: %v", j.combinedQuery, j.subreddit, err)
+				log.Printf("[SCRAPER ERROR] kind=%s query=%q sub=%q | Err: %v",
+					j.kind, j.query, j.subreddit, err)
 			}
 			resultsCh <- jobResult{items: items, err: err, job: j}
 		}(job)
@@ -93,17 +127,22 @@ func HandleScrape(w http.ResponseWriter, r *http.Request) {
 		close(resultsCh)
 	}()
 
+	// Dedup by ExternalID — same post can show up in both a keyword search
+	// and a subreddit pull. We keep the FIRST occurrence (deterministic given
+	// job dispatch order, though results arrive non-deterministically).
 	seen := make(map[string]struct{})
 	allItems := make([]models.ScrapedItem, 0)
 	var sourceErrors []models.SourceError
 
-	allKeywords := append(req.IncludeKeywords, req.BrandKeywords...)
-
 	for res := range resultsCh {
 		if res.err != nil {
+			queryLabel := res.job.query
+			if queryLabel == "" {
+				queryLabel = "r/" + res.job.subreddit
+			}
 			sourceErrors = append(sourceErrors, models.SourceError{
 				Source:  "reddit",
-				Query:   res.job.combinedQuery,
+				Query:   queryLabel,
 				Message: res.err.Error(),
 			})
 			continue
@@ -114,15 +153,11 @@ func HandleScrape(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			seen[item.ExternalID] = struct{}{}
-
-			matchedKw := findMatchingKeyword(item.Title+" "+item.Content, allKeywords)
-			if matchedKw != "" {
-				item.MatchedKeyword = matchedKw
-				item.IsBrandMention = isBrandKeyword(matchedKw, req.BrandKeywords)
-				allItems = append(allItems, item)
-			}
+			allItems = append(allItems, item)
 		}
 	}
+
+	log.Printf("[SCRAPER] done: %d items, %d errors", len(allItems), len(sourceErrors))
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(models.ScrapeResult{
@@ -131,85 +166,65 @@ func HandleScrape(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func executeRedditBatch(job fetchBatchJob, req *models.ScrapeRequest) ([]models.ScrapedItem, error) {
+// executeRedditBatch dispatches a single job through the rate limiter and
+// circuit breaker, then to the right reddit.Client method.
+//
+// The rate-limiter + circuit-breaker wrapping is UNCHANGED from v1 —
+// this is the safety net that keeps us from getting IP-banned by Reddit.
+func executeRedditBatch(job batchJob, req *models.ScrapeRequest) ([]models.ScrapedItem, error) {
 	ctx := context.Background()
 	if err := redditLimiter.Wait(ctx); err != nil {
 		return nil, err
 	}
 
 	result, err := redditBreaker.Execute(func() (interface{}, error) {
-		return redditClient.FetchSearchBatch(
-			job.combinedQuery,
+		if job.kind == "keyword" {
+			return redditClient.FetchSearchBatch(
+				job.query,
+				req.Sort,
+				req.SinceTimestamp,
+				req.IncludeComments,
+			)
+		}
+		// subreddit pull — always posts-only, IncludeComments is N/A
+		return redditClient.FetchSubredditBatch(
 			job.subreddit,
-			req.Since,
-			req.Before,
-			req.Mode,
-			req.ExcludeKeywords,
+			req.Sort,
+			req.SinceTimestamp,
 		)
 	})
 
 	if err != nil {
 		return nil, err
 	}
-
+	if result == nil {
+		return nil, nil
+	}
 	return result.([]models.ScrapedItem), nil
 }
 
-func buildBatchJobs(req *models.ScrapeRequest) []fetchBatchJob {
-	allKws := append(req.IncludeKeywords, req.BrandKeywords...)
-	if len(allKws) == 0 {
-		return nil
+// buildBatchJobs fans the payload out into individual fetch jobs.
+//
+//   - one job per keyword       → global Reddit search (no subreddit restriction)
+//   - one job per subreddit     → latest-posts pull (no keyword filter)
+//
+// Empty strings are skipped defensively.
+func buildBatchJobs(req *models.ScrapeRequest) []batchJob {
+	var jobs []batchJob
+
+	for _, kw := range req.Keywords {
+		if kw == "" {
+			continue
+		}
+		jobs = append(jobs, batchJob{kind: "keyword", query: kw})
 	}
 
-	var combinedQuery string
-	if len(allKws) == 1 {
-		combinedQuery = allKws[0]
-	} else {
-		var terms []string
-		for _, kw := range allKws {
-			if strings.Contains(kw, " ") {
-				terms = append(terms, fmt.Sprintf("%q", kw))
-			} else {
-				terms = append(terms, kw)
-			}
+	for _, sub := range req.Subreddits {
+		if sub == "" {
+			continue
 		}
-		combinedQuery = strings.Join(terms, " OR ")
-	}
-
-	var jobs []fetchBatchJob
-	if len(req.Subreddits) > 0 {
-		for _, sub := range req.Subreddits {
-			jobs = append(jobs, fetchBatchJob{
-				combinedQuery: combinedQuery,
-				subreddit:     sub,
-			})
-		}
-	} else {
-		jobs = append(jobs, fetchBatchJob{
-			combinedQuery: combinedQuery,
-			subreddit:     "",
-		})
+		jobs = append(jobs, batchJob{kind: "subreddit", subreddit: sub})
 	}
 
 	return jobs
-}
-
-func findMatchingKeyword(text string, keywords []string) string {
-	lowerText := strings.ToLower(text)
-	for _, kw := range keywords {
-		if kw != "" && strings.Contains(lowerText, strings.ToLower(kw)) {
-			return kw
-		}
-	}
-	return ""
-}
-
-func isBrandKeyword(kw string, brandKws []string) bool {
-	lowerKW := strings.ToLower(kw)
-	for _, bKw := range brandKws {
-		if strings.ToLower(bKw) == lowerKW {
-			return true
-		}
-	}
-	return false
 }

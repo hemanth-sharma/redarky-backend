@@ -1,3 +1,6 @@
+"""
+app/auth/service.py
+"""
 from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +27,9 @@ async def register_user(db: AsyncSession, payload: RegisterRequest) -> TokenPair
         email=payload.email,
         full_name=payload.full_name,
         password_hash=hash_password(payload.password),
+        # MVP defaults: free plan, active subscription
+        plan="free",
+        subscription_status="active",
     )
     db.add(user)
     await db.commit()
@@ -36,4 +42,11 @@ async def login_user(db: AsyncSession, payload: LoginRequest) -> TokenPair:
     user = result.scalar_one_or_none()
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account deactivated")
     return _issue_token_pair(str(user.id))
+
+
+async def get_user_by_id(db: AsyncSession, user_id: str) -> User | None:
+    result = await db.execute(select(User).where(User.id == user_id))
+    return result.scalar_one_or_none()

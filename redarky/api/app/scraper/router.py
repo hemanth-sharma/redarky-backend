@@ -1,34 +1,31 @@
 """
-app/scraper/router.py  — simplified now that Celery drives live polling.
- 
-POST /scraper/run is kept for:
-  1. Manual on-demand scrape from the dashboard ("Fetch now" button).
-  2. Triggering a backfill on project creation.
- 
-Recurring live polls are driven by Celery Beat (scraper_tasks.py),
-NOT by this endpoint. This endpoint is synchronous-ish: it kicks off
-a Celery task and returns the job ID immediately.
+app/scraper/router.py
+
+Scraper endpoints — manual triggers + observability.
+
+  POST /scraper/run             → manually trigger a shared scraper batch
+  GET  /scraper/runs            → list recent scraper runs (debug dashboard)
+  GET  /scraper/runs/{run_id}   → view a specific scraper run's payload + stats
+
+For recurring polling, Celery Beat fires `run_shared_scraper_task` every
+30 min automatically — no need to call /scraper/run.
 """
- 
-import time
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
- 
+
 from app.database import get_db
 from app.auth.dependencies import get_current_user
 from app.auth.models import User
-from app.projects import service as project_service
-from app.keywords import service as keyword_service
-from app.keywords.models import KeywordType
-from app.scraper.schemas import ScraperRunRequest, ScrapedItem, GoScrapeResult
+from app.scraper.schemas import ScraperRunRequest, ScraperRunResponse
 from app.scraper import service as scraper_service
- 
-# Import the Celery tasks
-from app.workers.scraper_tasks import poll_project_live, backfill_project
- 
+from app.workers.scraper_tasks import run_manual_scrape_task
+from app.utils.exceptions import NotFoundException
+
 router = APIRouter(prefix="/scraper", tags=["Scraper"])
- 
- 
+
+
 @router.post("/run", status_code=status.HTTP_202_ACCEPTED)
 async def run_scraper(
     payload: ScraperRunRequest,
@@ -36,96 +33,53 @@ async def run_scraper(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Manually trigger a scrape for a project.
-    Returns a Celery job ID immediately; results arrive asynchronously.
- 
-    For live polling, don't call this — Celery Beat handles it automatically
-    once a project is activated.
+    Manually triggers a shared scraper batch (mostly for testing or
+    "Fetch now" button on the dashboard).
+
+    Returns immediately — the actual Go scraper call + ingestion + matching
+    happens in the Celery worker.
     """
-    # 1. Verify ownership
-    project = await project_service.get_project(
-        db=db, project_id=payload.project_id, owner_id=current_user.id
-    )
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found or unauthorized")
- 
-    # 2. Fetch project configuration
-    active_platforms = getattr(project, "platforms", ["reddit"])
-    target_subreddits = getattr(project, "target_subreddits", [])
- 
-    if not active_platforms:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No platforms configured for this project.",
-        )
- 
-    # 3. Load keywords
-    keywords = await keyword_service.get_keywords(db=db, project_id=payload.project_id)
-    include_keywords = [kw.keyword for kw in keywords if kw.keyword_type == KeywordType.INCLUDE]
-    exclude_keywords = [kw.keyword for kw in keywords if kw.keyword_type == KeywordType.EXCLUDE]
-    brand_keywords   = [kw.keyword for kw in keywords if kw.keyword_type == KeywordType.BRAND]
- 
-    if not include_keywords and not brand_keywords:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No include or brand keywords configured for this project.",
-        )
- 
-    project_str_id = str(payload.project_id)
- 
-    # 4. Dispatch the appropriate Celery task
-    if payload.backfill:
-        job = backfill_project.delay(
-            project_id=project_str_id,
-            include_keywords=include_keywords,
-            exclude_keywords=exclude_keywords,
-            brand_keywords=brand_keywords,
-            platforms=active_platforms,
-            subreddits=target_subreddits,
-        )
-        return {
-            "status": "accepted",
-            "mode": "backfill",
-            "job_id": job.id,
-            "message": "Backfill started. Results will be available within a few minutes.",
-        }
-    else:
-        job = poll_project_live.delay(
-            project_id=project_str_id,
-            include_keywords=include_keywords,
-            exclude_keywords=exclude_keywords,
-            brand_keywords=brand_keywords,
-            platforms=active_platforms,
-            subreddits=target_subreddits,
-        )
-        return {
-            "status": "accepted",
-            "mode": "live",
-            "job_id": job.id,
-            "message": "Live poll started.",
-        }
- 
- 
-@router.get("/job/{job_id}", status_code=status.HTTP_200_OK)
-async def get_scraper_job_status(
-    job_id: str,
+    # If project_id is given, verify ownership
+    if payload.project_id:
+        from app.projects import service as project_service
+        try:
+            await project_service.get_project(
+                db=db, project_id=payload.project_id, owner_id=current_user.id
+            )
+        except NotFoundException:
+            raise HTTPException(status_code=404, detail="Project not found or unauthorized")
+
+    # Fire the shared scraper task (async)
+    job = run_manual_scrape_task.delay(project_id=str(payload.project_id) if payload.project_id else None)
+
+    return {
+        "status": "accepted",
+        "mode": "backfill" if payload.backfill else "live",
+        "job_id": job.id,
+        "message": "Shared scraper batch started. Check /scraper/runs for results.",
+    }
+
+
+@router.get("/runs", response_model=list[ScraperRunResponse])
+async def list_scraper_runs(
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Check the status of a scraper job by Celery task ID.
-    Frontend can poll this after triggering a manual run.
-    """
-    from app.workers.celery_app import celery
-    from celery.result import AsyncResult
- 
-    result = AsyncResult(job_id, app=celery)
-    response = {
-        "job_id": job_id,
-        "status": result.status,  # PENDING | STARTED | SUCCESS | FAILURE | RETRY
-    }
-    if result.successful():
-        response["result"] = result.get()
-    elif result.failed():
-        response["error"] = str(result.result)
- 
-    return response
+    """Lists recent scraper runs — for debugging "why am I not getting leads?".
+    Returns the most recent `limit` runs globally (admin-style view for MVP)."""
+    return await scraper_service.list_scraper_runs(db=db, limit=limit)
+
+
+@router.get("/runs/{run_id}", response_model=ScraperRunResponse)
+async def get_scraper_run(
+    run_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns a single scraper run's payload + stats — lets you see exactly
+    what keywords/subreddits were sent to Go and how many items came back."""
+    try:
+        return await scraper_service.get_scraper_run(db=db, run_id=run_id)
+    except NotFoundException as e:
+        raise HTTPException(status_code=404, detail=e.message)

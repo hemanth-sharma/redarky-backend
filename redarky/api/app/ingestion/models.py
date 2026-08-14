@@ -1,85 +1,68 @@
+"""
+app/ingestion/models.py
 
-import uuid
-import logging
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+Global ingestion domain — the data lake.
 
-from sqlalchemy import String, Text, Integer, Boolean, BigInteger, DateTime, ForeignKey, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID, insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
+RawPost is a GLOBAL dedup table. It is NOT scoped to a project.
+The matching engine decides which projects each RawPost belongs to.
+
+TTL: 7 days (hardcoded). The cleanup cron deletes rows past expires_at.
+This keeps the table small — we only keep raw data long enough for the
+matching engine to process it.
+
+Dedup key: (source, external_id) — e.g. ("reddit", "t3_abc123").
+If the Go scraper returns the same Reddit post in two batches, the second
+insert is silently ignored (ON CONFLICT DO NOTHING).
+"""
+from datetime import datetime
+from uuid import uuid4
+
+from sqlalchemy import (
+    String, Text, Integer, BigInteger, DateTime, ForeignKey, Index, func
+)
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
 
 
 class RawPost(Base):
-    """
-    Global shared table — one row per unique (source, external_id) across
-    ALL projects and users. This is the key to the shared-scraping architecture:
-    100 users watching r/forhire = the same posts live here once.
-
-    Projects are linked via keyword_matches (not a FK here).
-    """
     __tablename__ = "raw_posts"
+    __table_args__ = (
+        # Dedup index — used by ON CONFLICT DO NOTHING
+        Index("uq_raw_posts_source_external", "source", "external_id", unique=True),
+        # TTL cleanup index — cron deletes WHERE expires_at < now()
+        Index("ix_raw_posts_expires_at", "expires_at"),
+        Index("ix_raw_posts_subreddit", "subreddit"),
+    )
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
 
-    # Source identity
-    source: Mapped[str] = mapped_column(String(32), nullable=False)          # "reddit" | "hn"
-    external_id: Mapped[str] = mapped_column(String(255), nullable=False)    # e.g. "1abc2de"
-    source_run_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    # The Apify run ID that produced this row — useful for debugging
+    # Which scraper batch pulled this? (FK to scraper_runs.id)
+    scraper_run_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("scraper_runs.id", ondelete="SET NULL"),
+        nullable=True, index=True
+    )
 
-    # Content
-    title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    author: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # ── Provenance ───────────────────────────────────────────────────────────
+    source: Mapped[str] = mapped_column(String(32), nullable=False, index=True)  # "reddit"
+    external_id: Mapped[str] = mapped_column(String(128), nullable=False)        # "t3_abc123"
+
+    # ── Content ──────────────────────────────────────────────────────────────
+    title: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    author: Mapped[str] = mapped_column(String(255), nullable=False, default="unknown")
     url: Mapped[str] = mapped_column(Text, nullable=False)
+    score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    comments_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
-    # Engagement
-    score: Mapped[Optional[int]] = mapped_column(Integer, default=0, nullable=True)
-    comments_count: Mapped[Optional[int]] = mapped_column(Integer, default=0, nullable=True)
+    # "post" | "comment"
+    post_type: Mapped[str] = mapped_column(String(32), default="post", nullable=False)
+    subreddit: Mapped[str] = mapped_column(String(255), default="", nullable=False)
 
-    # Classification
-    post_type: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)  # "post" | "comment"
-    subreddit: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # ── Platform timestamp (Unix epoch, seconds) ─────────────────────────────
+    created_at_platform: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
-    # Timestamps
-    created_at_platform: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    # Set to fetched_at + RAW_POST_TTL_DAYS. Nightly cleanup deletes expired rows.
-
-    __table_args__ = (
-        UniqueConstraint("source", "external_id", name="uq_raw_post_source_external_id"),
-    )
-
-
-class KeywordMatch(Base):
-    """
-    Links a raw_post to a specific project when that post matched one of the
-    project's keywords. This is how the global raw_posts table becomes
-    per-user results.
-
-    One raw_post can have many KeywordMatch rows (multiple projects, multiple keywords).
-    """
-    __tablename__ = "keyword_matches"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    raw_post_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("raw_posts.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    matched_keyword: Mapped[str] = mapped_column(String(512), nullable=False)
-    match_type: Mapped[str] = mapped_column(String(16), nullable=False)  # "include" | "brand"
-    is_processed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    # False = AI scoring hasn't run yet. True = lead was created or item was rejected.
-    matched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-
-    __table_args__ = (
-        # Prevent duplicate matches: same post + same project + same keyword
-        UniqueConstraint("raw_post_id", "project_id", "matched_keyword",
-                         name="uq_keyword_match_post_project_keyword"),
-    )
+    # ── TTL ──────────────────────────────────────────────────────────────────
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)

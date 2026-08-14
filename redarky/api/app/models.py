@@ -1,38 +1,49 @@
-from app.ai.models import Agent, AgentRun
-from app.auth.models import User, RedditCredential
-from app.data.models import Report, EngagementAction, DataItem, Embedding, MarketGap, PipelineBatch
-from app.missions.models import Mission
-from app.keywords.models import Keyword
-from app.projects.models import Project
-from app.posts.models import Post
-from app.leads.models import Lead
+"""
+app/models.py
 
+Aggregator — imports every model so Alembic autogenerate sees them all
+and so other modules can `from app.models import User, Project, ...`.
+
+LEGACY MODULES REMOVED:
+  - app.ai          (not used in MVP)
+  - app.agents      (not used in MVP)
+  - app.data        (replaced by ingestion + matching + posts)
+  - app.missions    (replaced by projects)
+
+If you want to keep those folders around for reference, fine — but
+do NOT import their models here. Alembic will only manage what's
+imported in this file.
+"""
 from app.database import Base
 
-# Export them for easy access elsewhere
+from app.auth.models import User
+from app.projects.models import Project
+from app.keywords.models import Keyword
+from app.sources.models import MonitoredSource, ProjectSource
+from app.scraper.models import ScraperRun
+from app.ingestion.models import RawPost
+from app.matching.models import KeywordMatch, PostEmbedding
+from app.posts.models import MatchedPost
+from app.leads.models import Lead, LeadStatus
+
 __all__ = [
     "Base",
+    # Identity
     "User",
-    "RedditCredential",
-    "Mission",
-    "Report",
-    "EngagementAction",
-    "DataItem",
-    "Embedding",
-    "MarketGap",
-    "Agent",
+    # Project
+    "Project",
+    # Targets
+    "Keyword",
+    "MonitoredSource",
+    "ProjectSource",
+    # Ingestion
+    "ScraperRun",
+    "RawPost",
+    # Matching
+    "KeywordMatch",
+    "PostEmbedding",
+    # Delivery
+    "MatchedPost",
+    "Lead",
+    "LeadStatus",
 ]
-# __all__ = [
-#     "Base",
-#     "User",
-#     "RedditCredential",
-#     "Mission",
-#     "Report",
-#     "EngagementAction",
-#     "DataItem",
-#     "Embedding",
-#     "MarketGap",
-#     "Agent",
-#     "AgentRun",
-#     "PipelineBatch",
-# ]

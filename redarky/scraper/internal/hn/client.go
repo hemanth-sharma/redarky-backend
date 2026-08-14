@@ -57,7 +57,7 @@ func FetchHN(query string, since int64, excludeKeywords []string) ([]models.Scra
 		return nil, fmt.Errorf("HN JSON decode: %w", err)
 	}
 
-	now := time.Now().Format(time.RFC3339)
+	// now := time.Now().Format(time.RFC3339)
 	var results []models.ScrapedItem
 
 	for _, hit := range data.Hits {
@@ -112,8 +112,6 @@ func FetchHN(query string, since int64, excludeKeywords []string) ([]models.Scra
 			Score:      hit.Points,
 			Subreddit:  "",
 			PostType:   postType,
-			CreatedAt:  hit.CreatedAtI,
-			ScrapedAt:  now,
 		})
 	}
 

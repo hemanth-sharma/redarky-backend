@@ -1,245 +1,106 @@
 """
 app/workers/scraper_tasks.py
 
-Celery tasks responsible for driving the Go scraper on a per-project schedule.
+Celery tasks for the shared scraper pipeline.
 
-Architecture:
-  - poll_project_live()  → runs every N minutes per active project (Celery Beat)
-  - backfill_project()   → runs once on project creation to seed history
-  - process_batch()      → existing task: dedup + insert into DB (unchanged)
+Two entry points:
+  - run_shared_scraper_task  → Celery Beat fires every 30 min
+  - run_manual_scrape_task   → triggered by POST /scraper/run
 
-Polling cadence:
-  Beat schedule sends poll_project_live to a dedicated "scraper" queue.
-  Each project polls independently so one slow project doesn't block others.
+Both run the same flow:
+  1. Build shared payload from all active projects
+  2. Create a ScraperRun row (status=running)
+  3. POST /scrape to Go scraper
+  4. Bulk-upsert returned items into raw_posts (dedup)
+  5. Update ScraperRun with final counts
+  6. Run the 3-stage matching pipeline on new raw_post IDs
+
+The shared scraping model means N projects × M keywords = 1 Go call.
 """
-
-import time
+import asyncio
 import logging
-from datetime import datetime, timezone
-from uuid import UUID
 
-import httpx
+from app.database import SessionLocal
+from app.workers.celery_app import celery_app
+from app.scraper.service import run_shared_scrape, update_scraper_run_status
+from app.ingestion.service import bulk_upsert_raw_posts
+from app.matching.service import run_pipeline
 
-from app.workers.celery_app import celery
-from app.workers.tasks import process_batch
-from app.config import settings
-from app.storage.local_s3 import LocalS3Storage
-
-logger = logging.getLogger("celery.scraper")
-storage = LocalS3Storage()
-
-# How far back to look on each live poll (seconds).
-# Set to slightly more than the poll interval so we never miss posts
-# between two polls (e.g. poll every 5 min, window = 6 min).
-LIVE_WINDOW_SECONDS = 6 * 60  # 6 minutes
+logger = logging.getLogger("uvicorn.workers.scraper")
 
 
-# ── Live poll task ─────────────────────────────────────────────────────────────
+@celery_app.task(name="app.workers.scraper_tasks.run_shared_scraper_task")
+def run_shared_scraper_task():
+    """Entry point — Celery Beat fires this every 30 min."""
+    asyncio.run(_run_shared_scraper_async())
 
-@celery.task(
-    name="scraper.poll_project_live",
-    bind=True,
-    max_retries=3,
-    default_retry_delay=30,  # seconds between retries
-    queue="scraper",
-)
-def poll_project_live(self, project_id: str, include_keywords: list[str],
-                      exclude_keywords: list[str], brand_keywords: list[str],
-                      platforms: list[str], subreddits: list[str]) -> dict:
+
+@celery_app.task(name="app.workers.scraper_tasks.run_manual_scrape_task")
+def run_manual_scrape_task(project_id: str | None = None):
     """
-    Called by Celery Beat every N minutes for each active project.
+    Manually triggered by POST /scraper/run.
 
-    Sends one request to the Go scraper covering the last LIVE_WINDOW_SECONDS,
-    then hands the result off to process_batch for dedup + DB insert.
-
-    The `since` timestamp is set to (now - LIVE_WINDOW_SECONDS) so we catch
-    everything since the last poll, with a small overlap buffer.
+    `project_id` is kept for API compatibility but currently ignored — the
+    scraper always pulls the shared batch (all active projects). Per-project
+    scraping was removed to save API quota.
     """
-    since = int(time.time()) - LIVE_WINDOW_SECONDS
+    asyncio.run(_run_shared_scraper_async())
 
-    logger.info(
-        "Live poll starting",
-        extra={"project_id": project_id, "since": since, "keywords": include_keywords},
-    )
 
-    payload = _build_go_payload(
-        project_id=project_id,
-        include_keywords=include_keywords,
-        exclude_keywords=exclude_keywords,
-        brand_keywords=brand_keywords,
-        platforms=platforms,
-        subreddits=subreddits,
-        since=since,
-        mode="live",
-    )
+async def _run_shared_scraper_async():
+    async with SessionLocal() as db:
+        try:
+            # ── 1. Scrape (builds payload, calls Go, creates ScraperRun row) ──
+            scraper_run = await run_shared_scrape(db)
+            items = getattr(scraper_run, "_items", [])
 
-    try:
-        result = _call_go_scraper(payload)
-    except Exception as exc:
-        logger.error("Go scraper call failed: %s", exc, extra={"project_id": project_id})
-        raise self.retry(exc=exc)
+            if not items:
+                logger.info("Scraper run %s: 0 items returned", scraper_run.id)
+                return {"scraper_run_id": str(scraper_run.id), "items": 0}
 
-    items = result.get("items") or []
-    errors = result.get("errors") or []
-
-    if errors:
-        for e in errors:
-            logger.warning(
-                "Scraper partial error: source=%s query=%s msg=%s",
-                e.get("source"), e.get("query"), e.get("message"),
+            # ── 2. Ingest (dedup) ─────────────────────────────────────────────
+            ingestion_result = await bulk_upsert_raw_posts(
+                db=db,
+                items=items,
+                scraper_run_id=scraper_run.id,
             )
 
-    if not items:
-        logger.info("Live poll: 0 new items", extra={"project_id": project_id})
-        return {"items_fetched": 0}
+            # ── 3. Update ScraperRun with final counts ────────────────────────
+            await update_scraper_run_status(
+                db, scraper_run,
+                status=scraper_run.status,
+                total_items=ingestion_result.total_received,
+                new_items=ingestion_result.new_inserted,
+                dup_items=ingestion_result.duplicates_skipped,
+            )
 
-    file_path = storage.write_json(
-        layer="raw",
-        mission_id=project_id,
-        payload=items,
-    )
+            logger.info(
+                "Scraper run %s: %d received, %d new, %d dupes",
+                scraper_run.id,
+                ingestion_result.total_received,
+                ingestion_result.new_inserted,
+                ingestion_result.duplicates_skipped,
+            )
 
-    # Fire-and-forget: process_batch handles dedup + DB insert asynchronously.
-    process_batch.delay(project_id, file_path)
+            # ── 4. Run 3-stage matching pipeline on new raw posts ─────────────
+            if ingestion_result.new_raw_post_ids:
+                pipeline_result = await run_pipeline(db, ingestion_result.new_raw_post_ids)
+                logger.info(
+                    "Pipeline complete: stage1=%s, stage2=%s, stage3=%s",
+                    pipeline_result.stage1.model_dump(),
+                    pipeline_result.stage2.model_dump(),
+                    pipeline_result.stage3.model_dump(),
+                )
+            else:
+                logger.info("No new raw posts to process — skipping pipeline")
 
-    logger.info(
-        "Live poll complete",
-        extra={"project_id": project_id, "items": len(items), "file": file_path},
-    )
-    return {"items_fetched": len(items), "file_path": file_path}
+            return {
+                "scraper_run_id": str(scraper_run.id),
+                "items_received": ingestion_result.total_received,
+                "new_inserted": ingestion_result.new_inserted,
+                "duplicates_skipped": ingestion_result.duplicates_skipped,
+            }
 
-
-# ── Backfill task ──────────────────────────────────────────────────────────────
-
-@celery.task(
-    name="scraper.backfill_project",
-    bind=True,
-    max_retries=2,
-    default_retry_delay=60,
-    queue="scraper",
-)
-def backfill_project(self, project_id: str, include_keywords: list[str],
-                     exclude_keywords: list[str], brand_keywords: list[str],
-                     platforms: list[str], subreddits: list[str],
-                     days_back: int = 30) -> dict:
-    """
-    Run once when a project is created to seed historical data.
-    Uses `mode=backfill` which tells the Go scraper to use relevance sort
-    and a longer time window.
-    """
-    since = int(time.time()) - (days_back * 24 * 60 * 60)
-
-    logger.info(
-        "Backfill starting",
-        extra={"project_id": project_id, "days_back": days_back},
-    )
-
-    payload = _build_go_payload(
-        project_id=project_id,
-        include_keywords=include_keywords,
-        exclude_keywords=exclude_keywords,
-        brand_keywords=brand_keywords,
-        platforms=platforms,
-        subreddits=subreddits,
-        since=since,
-        mode="backfill",
-    )
-
-    try:
-        result = _call_go_scraper(payload)
-    except Exception as exc:
-        logger.error("Backfill Go scraper failed: %s", exc, extra={"project_id": project_id})
-        raise self.retry(exc=exc)
-
-    items = result.get("items") or []
-
-    if not items:
-        logger.info("Backfill: 0 items found", extra={"project_id": project_id})
-        return {"items_fetched": 0}
-
-    file_path = storage.write_json(
-        layer="raw",
-        mission_id=project_id,
-        payload=items,
-    )
-    process_batch.delay(project_id, file_path)
-
-    logger.info(
-        "Backfill complete",
-        extra={"project_id": project_id, "items": len(items)},
-    )
-    return {"items_fetched": len(items), "file_path": file_path}
-
-
-# ── Celery Beat schedule registration ─────────────────────────────────────────
-#
-# This is NOT a periodic task with a fixed schedule because each project
-# can have a different poll interval. Instead, when a project is activated,
-# Python schedules a recurring PeriodicTask via django-celery-beat (or
-# equivalent) pointing at poll_project_live with that project's kwargs.
-#
-# If you're using celery beat with a static beat_schedule dict, you can
-# add entries dynamically by calling celery.conf.beat_schedule at runtime,
-# or — better — use the database-backed scheduler (celery-beat-django or
-# redbeat) so you can add/remove schedules without restarting the worker.
-#
-# Example using redbeat (recommended):
-#
-#   from redbeat import RedBeatSchedulerEntry
-#   import celery.schedules
-#
-#   entry = RedBeatSchedulerEntry(
-#       name=f"poll:{project_id}",
-#       task="scraper.poll_project_live",
-#       schedule=celery.schedules.schedule(run_every=300),  # every 5 min
-#       kwargs={
-#           "project_id": str(project_id),
-#           "include_keywords": [...],
-#           ...
-#       },
-#       app=celery,
-#   )
-#   entry.save()
-#
-# To cancel when a project is paused/deleted:
-#   entry = RedBeatSchedulerEntry.from_key(f"redbeat:poll:{project_id}", app=celery)
-#   entry.delete()
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _build_go_payload(
-    project_id: str,
-    include_keywords: list[str],
-    exclude_keywords: list[str],
-    brand_keywords: list[str],
-    platforms: list[str],
-    subreddits: list[str],
-    since: int,
-    mode: str,
-) -> dict:
-    return {
-        "project_id": project_id,
-        "include_keywords": include_keywords,
-        "exclude_keywords": exclude_keywords,
-        "brand_keywords": brand_keywords,
-        "platforms": platforms,
-        "subreddits": subreddits,
-        "since": since,
-        "mode": mode,
-    }
-
-
-def _call_go_scraper(payload: dict) -> dict:
-    """
-    Sends a POST /scrape to the Go microservice and returns the parsed JSON.
-    Raises on HTTP error or timeout.
-    """
-    url = settings.GO_SCRAPER_URL
-    if not url.endswith("/scrape"):
-        url = f"{url}/scrape"
-
-    with httpx.Client(timeout=45.0) as client:
-        response = client.post(url, json=payload)
-        response.raise_for_status()
-        return response.json()
+        except Exception as e:
+            logger.exception("Shared scraper task failed: %s", e)
+            raise

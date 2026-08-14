@@ -1,91 +1,74 @@
+"""
+app/sources/service.py
 
-# ── Service functions ──────────────────────────────────────────────────────────
-import uuid
+Manages the global MonitoredSource registry and the ProjectSource join table.
+
+NO APIFY: All Apify coupling has been removed. Scheduling is handled by
+Celery Beat, which calls the Go scraper directly with the shared payload
+(see app/scraper/service.py).
+
+The shared-scraping logic:
+  - When user A adds r/SaaS, MonitoredSource row is created with
+    subscriber_count=1, is_active=True.
+  - When user B adds r/SaaS, subscriber_count becomes 2 (no new source row).
+  - When either removes it, subscriber_count decreases.
+  - When subscriber_count hits 0, is_active=False → Celery Beat skips it.
+"""
 import logging
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from uuid import UUID
 
-from sqlalchemy import String, Integer, Boolean, DateTime, ForeignKey, UniqueConstraint, select, and_
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import Base
-from app.apify.scheduler import (
-    create_subreddit_schedule,
-    pause_subreddit_schedule,
-    resume_subreddit_schedule,
-    trigger_immediate_run,
-)
-from app.sources.models import ProjectSource, MonitoredSource
+from app.models import MonitoredSource, ProjectSource
+from app.sources.schemas import SourceAddRequest, SourceType
+from app.utils.exceptions import NotFoundException
 
 logger = logging.getLogger("uvicorn.sources")
 
 
-
-async def add_subreddit_to_project(
+async def add_source_to_project(
     db: AsyncSession,
     project_id: UUID,
-    subreddit: str,
+    source_in: SourceAddRequest,
 ) -> MonitoredSource:
     """
-    Called when a user adds a subreddit to their project from the dashboard.
+    Links a source to a user's project.
 
     Steps:
-      1. Get or create a MonitoredSource row for this subreddit
-      2. If brand new: create an Apify schedule + trigger immediate run
-      3. If existed but was paused: resume the Apify schedule
-      4. Link the project to the source via ProjectSource
-      5. Increment subscriber_count
+      1. Get or create the global MonitoredSource row
+      2. Create ProjectSource link if not exists
+      3. Increment subscriber_count
+      4. If subscriber_count went 0 → 1, flip is_active=True
     """
-    subreddit = subreddit.lower().strip()
+    # Normalize identifier (lowercase for reddit subreddits)
+    identifier = source_in.identifier.lower().strip()
 
     # Step 1: get or create
     result = await db.execute(
         select(MonitoredSource).where(
             and_(
-                MonitoredSource.source_type == "reddit",
-                MonitoredSource.identifier == subreddit,
+                MonitoredSource.source_type == source_in.source_type.value,
+                MonitoredSource.identifier == identifier,
             )
         )
     )
     source = result.scalar_one_or_none()
-    is_new = source is None
 
-    if is_new:
+    if source is None:
         source = MonitoredSource(
-            source_type="reddit",
-            identifier=subreddit,
-            interval_minutes=30,
+            source_type=source_in.source_type.value,
+            identifier=identifier,
+            interval_minutes=source_in.interval_minutes,
             subscriber_count=0,
-            is_active=False,  # set True after Apify schedule created
+            is_active=False,  # will flip to True below
         )
         db.add(source)
-        await db.flush()  # get the ID before async Apify call
+        await db.flush()  # get the ID
 
-    # Step 2/3: manage the Apify schedule
-    if is_new:
-        schedule_id = await create_subreddit_schedule(
-            subreddit=subreddit,
-            source_id=source.id,
-            interval_minutes=30,
-        )
-        if schedule_id:
-            source.apify_schedule_id = schedule_id
-            source.is_active = True
-            # Fire an immediate run so the user sees data right away
-            await trigger_immediate_run(subreddit=subreddit, source_id=source.id)
-        else:
-            logger.error("Could not create Apify schedule for r/%s", subreddit)
-
-    elif not source.is_active and source.apify_schedule_id:
-        # Source exists but was paused — resume it
-        resumed = await resume_subreddit_schedule(source.apify_schedule_id, subreddit)
-        if resumed:
-            source.is_active = True
-
-    # Step 4: link project to source
-    existing_link_result = await db.execute(
+    # Step 2: link project to source (if not already linked)
+    existing_link = await db.execute(
         select(ProjectSource).where(
             and_(
                 ProjectSource.project_id == project_id,
@@ -93,43 +76,42 @@ async def add_subreddit_to_project(
             )
         )
     )
-    existing_link = existing_link_result.scalar_one_or_none()
-
-    if not existing_link:
+    if not existing_link.scalar_one_or_none():
         link = ProjectSource(
             project_id=project_id,
             monitored_source_id=source.id,
-            source_identifier=subreddit,
-            is_active=True,
         )
         db.add(link)
-
-        # Step 5: increment subscriber count
+        # Step 3: increment subscriber count
         source.subscriber_count += 1
+        # Step 4: flip active if this is the first subscriber
+        if source.subscriber_count == 1:
+            source.is_active = True
+            logger.info("Activated source %s/%s (first subscriber)", source.source_type, source.identifier)
 
     await db.commit()
-    logger.info("Added r/%s to project %s (subscriber_count=%d)", subreddit, project_id, source.subscriber_count)
+    await db.refresh(source)
     return source
 
 
-async def remove_subreddit_from_project(
+async def remove_source_from_project(
     db: AsyncSession,
     project_id: UUID,
-    subreddit: str,
+    source_type: str,
+    identifier: str,
 ) -> None:
     """
-    Called when a user removes a subreddit from their project.
-
-    If subscriber_count hits 0, pauses the Apify schedule so we stop
-    paying for a source nobody is watching.
+    Removes a source from a project. If subscriber_count hits 0, the
+    source is deactivated (is_active=False) so Celery Beat stops
+    including it in scraper batches.
     """
-    subreddit = subreddit.lower().strip()
+    identifier = identifier.lower().strip()
 
     source_result = await db.execute(
         select(MonitoredSource).where(
             and_(
-                MonitoredSource.source_type == "reddit",
-                MonitoredSource.identifier == subreddit,
+                MonitoredSource.source_type == source_type,
+                MonitoredSource.identifier == identifier,
             )
         )
     )
@@ -151,11 +133,54 @@ async def remove_subreddit_from_project(
         await db.delete(link)
         source.subscriber_count = max(0, source.subscriber_count - 1)
 
-    # If nobody is watching this source anymore, pause the schedule
-    if source.subscriber_count == 0 and source.apify_schedule_id:
-        paused = await pause_subreddit_schedule(source.apify_schedule_id, subreddit)
-        if paused:
+        # Auto-deactivate when nobody is watching
+        if source.subscriber_count == 0:
             source.is_active = False
-            logger.info("Paused r/%s schedule — no subscribers", subreddit)
+            logger.info(
+                "Deactivated source %s/%s (no subscribers)",
+                source.source_type,
+                source.identifier,
+            )
 
     await db.commit()
+
+
+async def get_project_sources(db: AsyncSession, project_id: UUID) -> list[MonitoredSource]:
+    """Returns all sources a project is watching."""
+    stmt = (
+        select(MonitoredSource)
+        .join(ProjectSource, ProjectSource.monitored_source_id == MonitoredSource.id)
+        .where(ProjectSource.project_id == project_id)
+        .order_by(MonitoredSource.identifier)
+    )
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+# ── Scraper-facing: get all active sources for shared batch ──────────────────
+async def get_active_sources_for_scraper(db: AsyncSession) -> list[MonitoredSource]:
+    """
+    Returns all MonitoredSource rows where is_active=True.
+    Used by the scraper service to build the shared Go scraper payload.
+
+    Each row is included ONCE per batch — multiple projects watching the
+    same subreddit share the same scrape.
+    """
+    stmt = (
+        select(MonitoredSource)
+        .where(MonitoredSource.is_active == True)
+        .order_by(MonitoredSource.last_scraped_at.asc().nullsfirst())
+    )
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def mark_source_scraped(db: AsyncSession, source_id: UUID) -> None:
+    """Called by the scraper service after a batch completes."""
+    result = await db.execute(
+        select(MonitoredSource).where(MonitoredSource.id == source_id)
+    )
+    source = result.scalar_one_or_none()
+    if source:
+        source.last_scraped_at = datetime.now(timezone.utc)
+        await db.commit()
