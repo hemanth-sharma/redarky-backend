@@ -3,13 +3,15 @@ package scraper
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
-	"sync"
-	"time"
-
+	"os"
+	"path/filepath"
 	"redarky/internal/models"
 	"redarky/internal/reddit"
+	"sync"
+	"time"
 
 	"github.com/sony/gobreaker"
 	"golang.org/x/time/rate"
@@ -159,11 +161,42 @@ func HandleScrape(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[SCRAPER] done: %d items, %d errors", len(allItems), len(sourceErrors))
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(models.ScrapeResult{
+	// Prepare payload map/struct to save
+	payload := models.ScrapeResult{
 		Items:  allItems,
 		Errors: sourceErrors,
-	})
+	}
+
+	// 1. Ensure the directory "redarky_data_s3/raw" exists (0755 provides read/write/execute permissions)
+	dirPath := filepath.Join("redarky_data_s3", "raw")
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		log.Printf("[SCRAPER STORAGE ERROR] failed to create directory: %v", err)
+		// We don't return an HTTP error here unless you want local file persistence to be a hard requirement
+	} else {
+		// 2. Build file name using dynamic timestamp (Unix Nano or Milliseconds ensures uniqueness)
+		timestamp := time.Now().UnixNano()
+		fileName := fmt.Sprintf("scrape_%d.json", timestamp)
+		filePath := filepath.Join(dirPath, fileName)
+
+		// 3. Create the file and write JSON content directly to it
+		file, err := os.Create(filePath)
+		if err != nil {
+			log.Printf("[SCRAPER STORAGE ERROR] failed to create file %s: %v", filePath, err)
+		} else {
+			defer file.Close()
+			encoder := json.NewEncoder(file)
+			encoder.SetIndent("", "    ") // Optional: Makes file readable instead of a single minified line
+
+			if err := encoder.Encode(payload); err != nil {
+				log.Printf("[SCRAPER STORAGE ERROR] failed to write JSON payload to file: %v", err)
+			} else {
+				log.Printf("[SCRAPER] locally backed up to: %s", filePath)
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 // executeRedditBatch dispatches a single job through the rate limiter and
