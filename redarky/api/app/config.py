@@ -24,6 +24,7 @@ class Settings(BaseSettings):
 
     # Celery beat sechedule
     SCRAPER_INTERVAL_MINUTES: int = 30
+    LLM_INTERNAL_MINUTES: int = 10
     CLEANUP_INTERVAL_HOURS: int = 24
 
     # Ingestion webhook shared secret

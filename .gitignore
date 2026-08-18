@@ -19,6 +19,10 @@ ENV/
 .env*
 .pytest_cache/
 
+celerybeat-schedule.bak
+celerybeat-schedule.dir
+celerybeat-schedule.dat
+
 # --- Alembic ---
 # We keep the .py files in versions, but ignore the cache
 redarky/api/alembic/__pycache__/

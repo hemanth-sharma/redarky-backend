@@ -1,4 +1,4 @@
-.PHONY: run-go run-fastapi run-worker run-flower run-sync help
+.PHONY: run-go run-fastapi run-worker run-beat run-all-celery run-flower run-sync help
 
 ## --- GO SCRAPER ---
 run-go:
@@ -14,6 +14,16 @@ run-worker:
 	@echo "Starting Celery Worker with solo pool..."
 	cd redarky/api && uv run celery -A app.workers.celery_app.celery worker --loglevel=info -P solo
 	
+# Standalone scheduler process
+run-beat:
+	@echo "Starting Celery Beat Scheduler..."
+	cd redarky/api && uv run celery -A app.workers.celery_app.celery beat --loglevel=info
+
+# Combined worker + beat for convenient single-terminal local testing
+run-worker-beat:
+	@echo "Starting Celery Worker with embedded Beat scheduler..."
+	cd redarky/api && uv run celery -A app.workers.celery_app.celery worker --loglevel=info -P solo -B
+
 run-flower:
 	@echo "Starting Celery Flower with uv..."
 	cd redarky/api && uv run celery -A app.workers.celery_app.celery flower --port=5555
@@ -36,9 +46,11 @@ run-dir:
 ## --- HELP ---
 help:
 	@echo "Usage:"
-	@echo "  make run-go      - Run Go Scraper"
-	@echo "  make run-fastapi - Run FastAPI server (via uv)"
-	@echo "  make run-worker  - Run Celery worker (via uv)"
-	@echo "  make run-flower  - Run Celery Flower (via uv)"
-	@echo "  make run-sync    - Create/Sync venv and install all deps"
+	@echo "  make run-go          - Run Go Scraper"
+	@echo "  make run-fastapi     - Run FastAPI server (via uv)"
+	@echo "  make run-worker      - Run Celery worker"
+	@echo "  make run-beat        - Run Celery beat scheduler"
+	@echo "  make run-worker-beat - Run combined Worker + Beat in 1 process (Local Dev)"
+	@echo "  make run-flower      - Run Celery Flower dashboard"
+	@echo "  make run-sync        - Create/Sync venv and install all deps"
 	@echo "  make run-venv    - Show manual activation command"

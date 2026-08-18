@@ -46,7 +46,7 @@ celery_app.conf.beat_schedule = {
     # retries failed LLM calls.
     "run-llm-filter": {
         "task": "app.workers.matching_tasks.run_llm_filter_task",
-        "schedule": settings.SCRAPER_INTERVAL_MINUTES * 60,  # every 10 min
+        "schedule": settings.LLM_INTERNAL_MINUTES * 60,  # every 10 min
     },
     # Nightly TTL cleanup — deletes expired raw_posts + matched_posts
     "run-ttl-cleanup": {
