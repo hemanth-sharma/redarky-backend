@@ -4,12 +4,12 @@
 FROM golang:1.25-alpine AS go-builder
 WORKDIR /build
 
-# Copy Go mod files relative to redarky directory
-COPY scraper/go.mod scraper/go.sum ./
+# Copy Go mod files from redarky/scraper/
+COPY redarky/scraper/go.mod redarky/scraper/go.sum ./
 RUN go mod download
 
-# Copy Go source files and build statically-linked binary
-COPY scraper/ ./
+# Copy all Go source files from redarky/scraper/
+COPY redarky/scraper/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o /build/go_scraper cmd/main.go
 
 # ==========================================
@@ -28,18 +28,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements from root level of workspace
+# Copy requirements from repository root
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy compiled Go scraper binary
+# Copy compiled Go scraper binary from build stage
 COPY --from=go-builder /build/go_scraper /app/go_scraper
 
-# Copy application source code
+# Copy Python application code
 COPY redarky/api /app/redarky/api
 COPY redarky/scraper /app/redarky/scraper
 
-# Set Python Path so 'app.main' and module imports resolve cleanly
+# Environment configuration
 ENV PYTHONPATH=/app/redarky/api:/app
 ENV CELERY_BROKER_URL=redis://127.0.0.1:6379/0
 ENV GO_SCRAPER_URL=http://127.0.0.1:8081/scrape
