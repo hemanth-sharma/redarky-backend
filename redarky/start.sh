@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -e
 
-# Default to 8000 if Render doesn't inject PORT
+# Default to 8000 if host environment doesn't inject PORT
 export PORT="${PORT:-8000}"
+export GO_SCRAPER_PORT="${GO_SCRAPER_PORT:-8081}"
 
-# Optional: Run Alembic migrations before spinning up services
+# Run Alembic migrations
 cd /app/redarky/api
-# python -m alembic upgrade head
 alembic upgrade head || true
 
 # Start Supervisor
