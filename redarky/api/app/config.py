@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     APIFY_REDDIT_ACTOR_ID: str = "default_actor_id_here"     
     APIFY_WEBHOOK_URL: str = "http://localhost:8000/ingestion/reddit"
 
+    # ALLOWED ORIGINS 
+    ALLOWED_ORIGINS: list = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
     model_config = SettingsConfigDict(
         env_file="../.env",

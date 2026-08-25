@@ -27,7 +27,7 @@ def run_cleanup_task():
 
 
 @run_async_db_task
-async def _run_cleanup_async():
+async def _run_cleanup_async(db):
     try:
         result = await run_full_cleanup(db)
         logger.info(

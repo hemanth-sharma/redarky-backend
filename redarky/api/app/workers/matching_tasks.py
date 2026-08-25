@@ -47,7 +47,7 @@ def run_llm_filter_task():
     return _run_llm_filter_async()
 
 @run_async_db_task
-async def _run_llm_filter_async():
+async def _run_llm_filter_async(db):
     try:
         result = await run_stage3_llm_filter(db, limit=50)
         logger.info(
@@ -74,7 +74,7 @@ def run_pipeline_task(raw_post_ids: list[str]):
     return _run_pipeline_async(raw_post_ids)
 
 @run_async_db_task
-async def _run_pipeline_async(raw_post_ids: list[str]):
+async def _run_pipeline_async(db, raw_post_ids: list[str]):
     try:
         ids = [uuid_mod.UUID(pid) for pid in raw_post_ids]
         result = await run_pipeline(db, ids)
@@ -101,7 +101,7 @@ def run_semantic_rescore_task():
 
 
 @run_async_db_task
-async def _run_semantic_rescore_async():
+async def _run_semantic_rescore_async(db):
     await db.execute(
         update(MatchedPost)
         .where(MatchedPost.is_processed_to_lead == False)

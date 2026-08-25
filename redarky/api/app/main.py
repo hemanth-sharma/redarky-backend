@@ -6,9 +6,11 @@ Redarky API v2 — Social Listening Lead Generation Platform.
 Includes all routers from the 9 domains:
   auth, projects, keywords, sources, scraper, ingestion, matching, posts, leads
 """
+import os
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth.router import router as auth_router
 from app.projects.router import router as project_router
@@ -23,6 +25,7 @@ from app.leads.router import router as lead_router
 from app.utils.exceptions import (
     NotFoundException, UnauthorizedException, DomainException, ConflictException,
 )
+from app.config import settings
 
 
 app = FastAPI(
@@ -31,6 +34,14 @@ app = FastAPI(
     version="2.0.0",
 )
 
+# CORS Middleware Configuration # Basic CORS 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in settings.ALLOWED_ORIGINS],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # ── Standardized error responses ─────────────────────────────────────────────
 def create_error_response(status_code: int, error_type: str, message: str) -> JSONResponse:
