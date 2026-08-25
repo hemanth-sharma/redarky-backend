@@ -44,3 +44,4 @@ asyncpg
 pydantic-settings
 bcrypt
 alembic
+pydantic[email]>=2.0.0
