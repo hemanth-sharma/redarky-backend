@@ -6,6 +6,7 @@ export PORT="${PORT:-8000}"
 
 # Optional: Run Alembic migrations before spinning up services
 cd /app/redarky/api
+# python -m alembic upgrade head
 alembic upgrade head || true
 
 # Start Supervisor

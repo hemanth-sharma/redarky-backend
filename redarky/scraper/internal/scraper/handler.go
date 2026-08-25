@@ -167,30 +167,33 @@ func HandleScrape(w http.ResponseWriter, r *http.Request) {
 		Errors: sourceErrors,
 	}
 
-	// 1. Ensure the directory "redarky_data_s3/raw" exists (0755 provides read/write/execute permissions)
-	dirPath := filepath.Join("redarky_data_s3", "raw")
-	if err := os.MkdirAll(dirPath, 0755); err != nil {
-		log.Printf("[SCRAPER STORAGE ERROR] failed to create directory: %v", err)
-		// We don't return an HTTP error here unless you want local file persistence to be a hard requirement
-	} else {
-		// 2. Build file name using dynamic timestamp (Unix Nano or Milliseconds ensures uniqueness)
-		timestamp := time.Now().UnixNano()
-		fileName := fmt.Sprintf("scrape_%d.json", timestamp)
-		filePath := filepath.Join(dirPath, fileName)
-
-		// 3. Create the file and write JSON content directly to it
-		file, err := os.Create(filePath)
-		if err != nil {
-			log.Printf("[SCRAPER STORAGE ERROR] failed to create file %s: %v", filePath, err)
+	// Conditionally write data to local disk only if SAVE_LOCAL_DATA is set to "true"
+	if os.Getenv("SAVE_LOCAL_DATA") == "true" {
+		// 1. Ensure the directory "redarky_data_s3/raw" exists (0755 provides read/write/execute permissions)
+		dirPath := filepath.Join("redarky_data_s3", "raw")
+		if err := os.MkdirAll(dirPath, 0755); err != nil {
+			log.Printf("[SCRAPER STORAGE ERROR] failed to create directory: %v", err)
+			// We don't return an HTTP error here unless you want local file persistence to be a hard requirement
 		} else {
-			defer file.Close()
-			encoder := json.NewEncoder(file)
-			encoder.SetIndent("", "    ") // Optional: Makes file readable instead of a single minified line
+			// 2. Build file name using dynamic timestamp (Unix Nano or Milliseconds ensures uniqueness)
+			timestamp := time.Now().UnixNano()
+			fileName := fmt.Sprintf("scrape_%d.json", timestamp)
+			filePath := filepath.Join(dirPath, fileName)
 
-			if err := encoder.Encode(payload); err != nil {
-				log.Printf("[SCRAPER STORAGE ERROR] failed to write JSON payload to file: %v", err)
+			// 3. Create the file and write JSON content directly to it
+			file, err := os.Create(filePath)
+			if err != nil {
+				log.Printf("[SCRAPER STORAGE ERROR] failed to create file %s: %v", filePath, err)
 			} else {
-				log.Printf("[SCRAPER] locally backed up to: %s", filePath)
+				defer file.Close()
+				encoder := json.NewEncoder(file)
+				encoder.SetIndent("", "    ") // Optional: Makes file readable instead of a single minified line
+
+				if err := encoder.Encode(payload); err != nil {
+					log.Printf("[SCRAPER STORAGE ERROR] failed to write JSON payload to file: %v", err)
+				} else {
+					log.Printf("[SCRAPER] locally backed up to: %s", filePath)
+				}
 			}
 		}
 	}
