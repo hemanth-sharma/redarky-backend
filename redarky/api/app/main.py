@@ -7,6 +7,8 @@ Includes all routers from the 9 domains:
   auth, projects, keywords, sources, scraper, ingestion, matching, posts, leads
 """
 import os
+import httpx
+import redis.asyncio as aioredis
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -22,6 +24,8 @@ from app.matching.router import router as matching_router
 from app.posts.router import router as post_router
 from app.leads.router import router as lead_router
 
+from app.workers.celery_app import celery
+
 from app.utils.exceptions import (
     NotFoundException, UnauthorizedException, DomainException, ConflictException,
 )
@@ -34,7 +38,7 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# CORS Middleware Configuration # Basic CORS 
+# CORS Middleware Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in settings.ALLOWED_ORIGINS],
@@ -106,7 +110,6 @@ async def domain_exception_handler(request: Request, exc: DomainException):
 
 @app.exception_handler(Exception)
 async def universal_fallback_handler(request: Request, exc: Exception):
-    # In production: log full stack trace here.
     return create_error_response(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         error_type="INTERNAL_SERVER_ERROR",
@@ -118,6 +121,64 @@ async def universal_fallback_handler(request: Request, exc: Exception):
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "2.0.0"}
+
+
+@app.get("/health/system")
+async def system_health_check():
+    """Checks operational status of Redis, Go Scraper, Celery Workers, and Beat."""
+    status_report = {
+        "fastapi": "ok",
+        "redis": "unknown",
+        "go_scraper": "unknown",
+        "celery_workers": "unknown",
+        "celery_beat": "unknown",
+    }
+
+    # 1. Check Redis Connection
+    try:
+        redis_url = getattr(settings, "REDIS_URL", "redis://127.0.0.1:6379/0")
+        redis_client = aioredis.from_url(redis_url, socket_timeout=2.0)
+        if await redis_client.ping():
+            status_report["redis"] = "ok (reachable)"
+        await redis_client.aclose()
+    except Exception as e:
+        status_report["redis"] = f"error: {str(e)}"
+
+    # 2. Check Go Scraper (internal port 8081)
+    try:
+        scraper_url = getattr(settings, "GO_SCRAPER_URL", "http://127.0.0.1:8081")
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            res = await client.get(f"{scraper_url}/health")
+            if res.status_code == 200:
+                status_report["go_scraper"] = "ok (reachable)"
+            else:
+                status_report["go_scraper"] = f"unexpected status: {res.status_code}"
+    except Exception as e:
+        status_report["go_scraper"] = f"unreachable: {str(e)}"
+
+    # 3. Check Celery Worker Ping
+    try:
+        inspect = celery.control.inspect(timeout=2.0)
+        active_workers = inspect.ping()
+        if active_workers:
+            status_report["celery_workers"] = f"ok ({len(active_workers)} active worker node(s))"
+        else:
+            status_report["celery_workers"] = "error: no active workers responded"
+    except Exception as e:
+        status_report["celery_workers"] = f"error: {str(e)}"
+
+    # 4. Check Celery Beat Schedule Responsiveness
+    try:
+        inspect = celery.control.inspect(timeout=2.0)
+        scheduled_tasks = inspect.scheduled()
+        if scheduled_tasks is not None:
+            status_report["celery_beat"] = "ok (responsive)"
+        else:
+            status_report["celery_beat"] = "warning: no scheduled tasks active"
+    except Exception as e:
+        status_report["celery_beat"] = f"error: {str(e)}"
+
+    return status_report
 
 
 @app.get("/")
