@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = ""
     LLM_MODEL_NAME: str = "gpt-4o-mini"
 
-    # Celery beat sechedule
+    # Celery beat schedule
     SCRAPER_INTERVAL_MINUTES: int = 30
     LLM_INTERNAL_MINUTES: int = 10
     CLEANUP_INTERVAL_HOURS: int = 24
@@ -36,8 +36,15 @@ class Settings(BaseSettings):
     APIFY_REDDIT_ACTOR_ID: str = "default_actor_id_here"     
     APIFY_WEBHOOK_URL: str = "http://localhost:8000/ingestion/reddit"
 
-    # ALLOWED ORIGINS 
-    ALLOWED_ORIGINS: list = ["http://localhost:5173", "http://127.0.0.1:5173", "https://redarky.vercel.app"]
+    # ALLOWED ORIGINS (stored as raw string from env, fallback defaults provided)
+    ALLOWED_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """Parses ALLOWED_ORIGINS into a clean list of strings for CORSMiddleware."""
+        if isinstance(self.ALLOWED_ORIGINS, list):
+            return self.ALLOWED_ORIGINS
+        return [origin.strip() for origin in self.ALLOWED_ORIGINS.split(",") if origin.strip()]
 
     model_config = SettingsConfigDict(
         env_file="../.env",
