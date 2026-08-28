@@ -147,7 +147,7 @@ async def system_health_check():
     # 2. Check Go Scraper (internal port 8081)
     try:
         scraper_url = getattr(settings, "GO_SCRAPER_URL", "http://127.0.0.1:8081")
-        async with httpx.AsyncClient(timeout=2.0) as client:
+        async with httpx.AsyncClient(timeout=2.0, follow_redirects=True) as client:
             res = await client.get(f"{scraper_url}/health")
             if res.status_code == 200:
                 status_report["go_scraper"] = "ok (reachable)"
