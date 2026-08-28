@@ -14,6 +14,11 @@ class Base(DeclarativeBase):
 
 engine = create_async_engine(
     settings.DATABASE_URL,
+    connect_args={
+        "prepared_statement_cache_size": 0,
+        "statement_cache_size": 0,
+    },
+    # Force connection over standard pool settings
     pool_pre_ping=True,      
     pool_size=5,              
     max_overflow=10,          
