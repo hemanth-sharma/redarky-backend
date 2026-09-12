@@ -32,7 +32,8 @@ class RawPost(Base):
         # Dedup index — used by ON CONFLICT DO NOTHING
         Index("uq_raw_posts_source_external", "source", "external_id", unique=True),
         # TTL cleanup index — cron deletes WHERE expires_at < now()
-        Index("ix_raw_posts_expires_at", "expires_at"),
+        # (expires_at column-level index=True already creates
+        #  ix_raw_posts_expires_at — same name, so no duplicate here)
         Index("ix_raw_posts_subreddit", "subreddit"),
     )
 

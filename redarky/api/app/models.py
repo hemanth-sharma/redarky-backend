@@ -5,7 +5,7 @@ Aggregator — imports every model so Alembic autogenerate sees them all
 and so other modules can `from app.models import User, Project, ...`.
 
 LEGACY MODULES REMOVED:
-  - app.ai          (not used in MVP)
+  - app.ai          (replaced by app/ai/embeddings + lead_agent for the new pipeline)
   - app.agents      (not used in MVP)
   - app.data        (replaced by ingestion + matching + posts)
   - app.missions    (replaced by projects)
@@ -25,6 +25,8 @@ from app.ingestion.models import RawPost
 from app.matching.models import KeywordMatch, PostEmbedding
 from app.posts.models import MatchedPost
 from app.leads.models import Lead, LeadStatus
+from app.feedback.models import Feedback, FeedbackVerification
+from app.integrations.models import Integration
 
 __all__ = [
     "Base",
@@ -46,4 +48,9 @@ __all__ = [
     "MatchedPost",
     "Lead",
     "LeadStatus",
+    # Feedback
+    "Feedback",
+    "FeedbackVerification",
+    # Integrations
+    "Integration",
 ]
