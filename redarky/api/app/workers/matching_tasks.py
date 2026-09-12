@@ -102,10 +102,12 @@ def run_semantic_rescore_task():
 
 @run_async_db_task
 async def _run_semantic_rescore_async(db):
+    # Reset Stage-2 markers so every unprocessed post is re-scored with the
+    # current scoring model (semantic_score NULL = "not yet Stage-2 scored")
     await db.execute(
         update(MatchedPost)
-        .where(MatchedPost.is_processed_to_lead == False)
-        .values(intent_score=BASE_KEYWORD_SCORE)
+        .where(MatchedPost.is_processed_to_lead == False)  # noqa: E712
+        .values(semantic_score=None, intent_score=0.0)
     )
     await db.commit()
 

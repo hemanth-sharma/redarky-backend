@@ -24,11 +24,27 @@ PostEmbedding:
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import String, Text, Float, DateTime, ForeignKey, Index, UniqueConstraint, func
+from sqlalchemy import String, Text, Float, DateTime, ForeignKey, Index, UniqueConstraint, func, types
 from sqlalchemy.dialects.postgresql import UUID, ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+
+
+class Embedding(types.TypeDecorator):
+    """Portable vector column.
+
+    Postgres → ARRAY(Float) — same as before, and lets pgvector's `<=>`
+    operator be applied on the fly via a text cast (see app/ai/embeddings.py).
+    SQLite / others → JSON — so the local dev DATABASE_URL works too.
+    """
+    impl = types.JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            return dialect.type_descriptor(ARRAY(Float))
+        return dialect.type_descriptor(types.JSON())
 
 
 class KeywordMatch(Base):
@@ -99,12 +115,11 @@ class PostEmbedding(Base):
     # The text we embedded (for debugging / re-embedding if model changes)
     embedded_text: Mapped[str] = mapped_column(Text, nullable=False)
 
-    # 384-dim vector — adjust if you swap embedding models.
-    # Uses ARRAY(Float) instead of pgvector's VECTOR type so we don't need
-    # the pgvector extension installed. For MVP scale (thousands of posts)
-    # cosine similarity in Python is fast enough. Switch to pgvector if/when
-    # you need indexed ANN search at million-row scale.
-    embedding: Mapped[list[float]] = mapped_column(ARRAY(Float), nullable=False)
+    # 384-dim vector (or 1536 for OpenAI embeddings) — adjust if you swap models.
+    # Embedding is ARRAY(Float) on Postgres and JSON on SQLite (see class above).
+    # Cosine similarity runs SQL-side with pgvector's `<=>` operator when the
+    # extension is available (app/ai/embeddings.py), else in Python.
+    embedding: Mapped[list[float]] = mapped_column(Embedding(), nullable=False)
 
     # Which model produced this (e.g. "minilm-l6-v2")
     model_name: Mapped[str] = mapped_column(String(64), default="minilm-l6-v2", nullable=False)

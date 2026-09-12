@@ -12,33 +12,39 @@ STAGE 1 — Keyword Match (cheap, deterministic)
     - Check if title/content contains any include keyword
     - Apply exclude keywords (filter out)
     - For each match: create KeywordMatch row + clone to MatchedPost
-      with intent_score=0 (initial)
+      with a provisional keyword-only score
 
-STAGE 2 — Semantic Score (non-LLM, local embeddings)
-  For each new MatchedPost without a score:
-    - Compute embedding of (title + " " + content) if not already cached
+STAGE 2 — Semantic Score
+  For each new MatchedPost where semantic_score IS NULL:
+    - Compute / fetch cached embedding of (title + " " + content)
     - Compute cosine similarity vs the project's profile embedding
-      (built from goal_description + company_description)
-    - Boost score if matched_intent_phrase is present
-      ("alternative to", "looking for", "any tool for", etc.)
-    - Update matched_posts.intent_score, matched_snippet, matched_intent_phrase
+      (built from goal_description + company info) — SQL-side via pgvector
+      when available (see app/ai/embeddings.py), else OpenAI embeddings,
+      else a continuous lexical-similarity fallback
+    - Combine with intent-phrase signals (word-boundary regex, weighted by
+      phrase strength) into a CONTINUOUS intent_score. No more quantized
+      {0.3, 0.5, 0.7, 0.9} buckets.
 
-STAGE 3 — LLM Filter (expensive, selective)
+STAGE 3 — LLM Filter (expensive, selective) — the Lead Agent
   For each MatchedPost where:
       intent_score >= project.llm_threshold
       AND is_processed_to_lead == False
-    - Send to LLM with project context + post text
-    - If LLM says "high intent lead":
-        - Create Lead row with llm_reason
-        - Set matched_posts.is_lead=True, is_processed_to_lead=True
+    - Run the LangGraph lead agent (app/ai/lead_agent.py):
+      retrieve_context → keyword_check → semantic_check → llm_grade → decide
+    - If agent says lead:
+        - Create Lead row with llm_reason + confidence
+        - Set matched_posts.is_lead=True, is_processed_to_lead=True,
+          llm_score=confidence, intent_score=blended final score
     - Else:
-        - Set matched_posts.is_processed_to_lead=True (don't re-process)
+        - Set matched_posts.is_processed_to_lead=True, llm_score=confidence
+    - Fan the new lead out to the owner's active integrations (Slack/Discord/
+      Teams/WhatsApp/Email webhooks) — best-effort, never breaks the pipeline.
 
 COST CONTROL:
   - Stage 1 runs on every raw post (cheap substring check)
   - Stage 2 runs only on Stage-1 survivors (~10-30% of raw)
-  - Stage 3 runs only on Stage-2 high-scorers (~1-5% of raw)
-  - LLM cost ≈ (raw_posts_per_day) × 0.05 × avg_tokens_per_call
+  - Stage 3 runs only on Stage-2 high-scorers (~1-5% of raw); the agent's
+    semantic router skips the LLM call entirely for weak posts
 """
 import logging
 import re
@@ -46,7 +52,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Sequence
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func, tuple_ as sa_tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -63,34 +69,112 @@ from app.matching.schemas import (
 logger = logging.getLogger("uvicorn.matching")
 
 
-# ── Intent-phrase boosters (Stage-2 heuristic) ───────────────────────────────
-# These phrases bump the intent_score when present in a matched post.
-# They signal active buying intent — exactly what lead-gen users want.
-INTENT_PHRASES = [
-    "alternative to",
-    "looking for",
-    "any tool for",
-    "anyone using",
-    "switch from",
-    "switching from",
-    "migrate from",
-    "better than",
-    "cheaper than",
-    "free alternative",
-    "open source alternative",
-    "recommend",
-    "should i use",
-    "vs",
-    "compared to",
-    "experience with",
-    "review of",
-    "honest review",
+# ═════════════════════════════════════════════════════════════════════════════
+# SCORING MODEL (continuous — replaces the old 0.3/0.5/0.7/0.9 buckets)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# intent_score = 0.05
+#             + 0.32 * semantic_signal    (0..1 — embedding/lexical similarity)
+#             + 0.38 * intent_signal      (0..1 — weighted buying phrases)
+#             + 0.18 * keyword_signal    (0..1 — number of matched keywords)
+#             + 0.07 * brand_signal       (0/1 — brand keyword mentioned)
+#
+# Range check (calibrated):
+#   random post, matched 1 keyword, no phrases, weak semantic (~0.10) → ~0.13
+#   related post, 1 keyword, one medium phrase, semantic 0.4          → ~0.55
+#   hot post, 2+ keywords, strong phrase, brand mention, semantic 0.6  → ~0.95
+
+# ── Intent phrases with strengths (word-boundary regex, NOT substring) ──────
+# Strong phrases signal active buying intent; weak ones only mild interest.
+INTENT_PHRASES: dict[str, float] = {
+    # Active buying intent
+    "alternative to": 1.00,
+    "free alternative": 1.00,
+    "open source alternative": 1.00,
+    "looking for": 0.95,
+    "any tool for": 0.95,
+    "need a tool": 0.90,
+    "need something": 0.80,
+    "switch from": 1.00,
+    "switching from": 1.00,
+    "migrate from": 0.95,
+    "cheaper than": 0.90,
+    "recommend a": 0.85,
+    "which tool": 0.85,
+    "what do you use for": 0.85,
+    "suggestions for": 0.75,
+    "should i use": 0.80,
+    # Medium intent
+    "anyone using": 0.60,
+    "better than": 0.60,
+    "compared to": 0.55,
+    "experience with": 0.55,
+    "worth it": 0.50,
+    # Weak / informational
+    "vs": 0.30,
+    "review of": 0.30,
+    "honest review": 0.35,
+}
+
+# Precompiled word-boundary regexes (fixes "obvious" matching "vs",
+# "recommended" matching "recommend", etc.)
+_INTENT_PATTERNS: list[tuple[re.Pattern, str, float]] = [
+    (re.compile(rf"\b{re.escape(phrase)}\b", re.IGNORECASE), phrase, strength)
+    for phrase, strength in INTENT_PHRASES.items()
 ]
 
-# Default intent score when Stage 1 keyword matches (before Stage 2 boost)
-BASE_KEYWORD_SCORE = 0.3
-INTENT_PHRASE_BOOST = 0.4
-BRAND_MENTION_BOOST = 0.2
+# Kept for backwards compatibility with anything importing the old name
+INTENT_PHRASES_LIST = list(INTENT_PHRASES.keys())
+
+BASE_KEYWORD_SCORE = 0.3  # legacy constant — see matching_tasks.py
+HIGH_SCORE_AUTO_PROMOTE = 0.85  # no-LLM auto-promotion floor
+
+
+def intent_signal(text: str) -> tuple[float, str]:
+    """Weighted intent-phrase signal.
+
+    Returns (signal 0..1, best_phrase). Multiple distinct phrases stack
+    with diminishing returns, so "looking for X vs Y" scores higher than
+    each phrase alone but never exceeds 1.0.
+    """
+    if not text:
+        return 0.0, ""
+    hits: list[tuple[float, str]] = [
+        (strength, phrase) for pattern, phrase, strength in _INTENT_PATTERNS
+        if pattern.search(text)
+    ]
+    if not hits:
+        return 0.0, ""
+    hits.sort(reverse=True)
+    best_strength, best_phrase = hits[0]
+    signal = best_strength
+    for strength, _ in hits[1:3]:  # up to 2 extra phrases stack
+        signal += strength * 0.25
+    return min(1.0, signal), best_phrase
+
+
+def keyword_signal(matched_count: int) -> float:
+    """1 keyword → 0.6, each additional +0.2, capped at 1.0."""
+    if matched_count <= 0:
+        return 0.0
+    return min(1.0, 0.6 + 0.2 * (matched_count - 1))
+
+
+def compute_intent_score(
+    semantic: float,
+    intent: float,
+    keyword: float,
+    brand: bool,
+) -> float:
+    """The continuous scoring formula documented above."""
+    score = (
+        0.05
+        + 0.32 * max(0.0, min(1.0, semantic))
+        + 0.38 * max(0.0, min(1.0, intent))
+        + 0.18 * max(0.0, min(1.0, keyword))
+        + (0.07 if brand else 0.0)
+    )
+    return round(min(1.0, max(0.0, score)), 4)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -112,7 +196,6 @@ async def run_stage1_keyword_match(
             matched_posts_created=0,
         )
 
-    # Load raw posts (only those not yet expired)
     raw_posts = (await db.execute(
         select(RawPost).where(
             and_(
@@ -133,21 +216,19 @@ async def run_stage1_keyword_match(
     keywords = (await db.execute(
         select(Keyword)
         .join(Project, Keyword.project_id == Project.id)
-        .where(Project.is_pipeline_active == True)
+        .where(Project.is_pipeline_active == True)  # noqa: E712
     )).scalars().all()
 
-    # Group keywords by project_id for efficient processing
     keywords_by_project: dict[uuid.UUID, list[Keyword]] = {}
     for kw in keywords:
         keywords_by_project.setdefault(kw.project_id, []).append(kw)
 
-    # Load projects (to get data_retention_days for matched_post.expires_at)
     project_ids = list(keywords_by_project.keys())
     projects = (await db.execute(
         select(Project).where(
             and_(
                 Project.id.in_(project_ids),
-                Project.is_pipeline_active == True,
+                Project.is_pipeline_active == True,  # noqa: E712
             )
         )
     )).scalars().all()
@@ -176,13 +257,14 @@ async def run_stage1_keyword_match(
             # ── Check include + brand keywords ──────────────────────────────
             best_match = None  # (keyword, snippet)
             is_brand_mention = False
+            match_count = 0
 
             for kw in project_keywords:
                 if kw.keyword_type not in ("include", "brand"):
                     continue
                 kw_lower = kw.keyword.lower()
                 if kw_lower in text:
-                    # Extract a snippet around the match
+                    match_count += 1
                     snippet = _extract_snippet(text, kw_lower, raw_post.title, raw_post.content)
                     if kw.keyword_type == "brand":
                         is_brand_mention = True
@@ -190,7 +272,6 @@ async def run_stage1_keyword_match(
                     if best_match is None or kw.keyword_type == "brand":
                         best_match = (kw, snippet)
 
-                    # Create KeywordMatch record
                     km = KeywordMatch(
                         raw_post_id=raw_post.id,
                         keyword_id=kw.id,
@@ -204,6 +285,14 @@ async def run_stage1_keyword_match(
             if best_match:
                 kw, snippet = best_match
                 expires_at = datetime.now(timezone.utc) + timedelta(days=project.data_retention_days)
+
+                # Provisional keyword-only score (continuous) — Stage 2 replaces it
+                provisional = compute_intent_score(
+                    semantic=0.0,
+                    intent=intent_signal(text)[0],
+                    keyword=keyword_signal(match_count),
+                    brand=is_brand_mention,
+                )
 
                 mp = MatchedPost(
                     project_id=project_id,
@@ -221,9 +310,11 @@ async def run_stage1_keyword_match(
                     created_at_platform=raw_post.created_at_platform,
                     matched_keyword=kw.keyword,
                     matched_snippet=snippet,
-                    intent_score=BASE_KEYWORD_SCORE,
+                    intent_score=provisional,
                     matched_intent_phrase="",
                     is_brand_mention=is_brand_mention,
+                    semantic_score=None,   # ← marks "not yet Stage-2 scored"
+                    llm_score=None,
                     is_processed_to_lead=False,
                     is_lead=False,
                     expires_at=expires_at,
@@ -243,12 +334,10 @@ async def run_stage1_keyword_match(
 def _extract_snippet(text_lower: str, keyword_lower: str, original_title: str, original_content: str) -> str:
     """Extracts a ~200-char snippet around the first occurrence of the keyword.
     Uses the original (non-lowered) text to preserve casing for display."""
-    # Find the position in the lowercased text
     pos = text_lower.find(keyword_lower)
     if pos < 0:
         return keyword_lower
 
-    # Map back to the original text — but original might be title+space+content
     original = f"{original_title} {original_content}"
     start = max(0, pos - 100)
     end = min(len(original), pos + len(keyword_lower) + 100)
@@ -261,7 +350,7 @@ def _extract_snippet(text_lower: str, keyword_lower: str, original_title: str, o
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STAGE 2: Semantic Score (non-LLM)
+# STAGE 2: Semantic Score
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def run_stage2_semantic_score(
@@ -269,17 +358,18 @@ async def run_stage2_semantic_score(
     limit: int = 500,
 ) -> SemanticScoreResult:
     """
-    For each MatchedPost with intent_score == BASE_KEYWORD_SCORE
-    (i.e., not yet scored by Stage 2):
+    For each MatchedPost where semantic_score IS NULL (not yet scored):
       - Compute or fetch cached embedding for the underlying RawPost
-      - Compute similarity vs project profile embedding
-      - Apply intent-phrase boost
-      - Update matched_post.intent_score, matched_intent_phrase
+      - Compute similarity vs the project profile embedding (per product —
+        every product has its own profile: goal, company, keywords)
+      - Combine with weighted intent-phrase signals into a continuous
+        intent_score (see SCORING MODEL above)
     """
-    # Load unscored matched posts
+    # Load unscored matched posts — the NULL semantic_score is the marker
     matched_posts = (await db.execute(
         select(MatchedPost)
-        .where(MatchedPost.intent_score == BASE_KEYWORD_SCORE)
+        .where(MatchedPost.semantic_score.is_(None))
+        .order_by(MatchedPost.created_at.desc())
         .limit(limit)
     )).scalars().all()
 
@@ -290,107 +380,123 @@ async def run_stage2_semantic_score(
             posts_above_threshold=0,
         )
 
-    # ── Lazy-init the embedding model (only if we have posts to score) ─────
-    embedder = _get_embedder()
-    if embedder is None:
-        # No embedding model configured — fall back to intent-phrase only
-        return await _stage2_phrase_only_fallback(db, matched_posts)
-
-    # ── Collect unique raw_post_ids that need embeddings ────────────────────
-    raw_post_ids = list({mp.raw_post_id for mp in matched_posts})
-
-    # ── Load existing embeddings (cache hit) ────────────────────────────────
-    existing_embs = (await db.execute(
-        select(PostEmbedding).where(PostEmbedding.raw_post_id.in_(raw_post_ids))
-    )).scalars().all()
-    emb_by_raw = {e.raw_post_id: e for e in existing_embs}
-
-    # ── Load raw posts that need new embeddings ─────────────────────────────
-    missing_ids = [pid for pid in raw_post_ids if pid not in emb_by_raw]
-    if missing_ids:
-        missing_raw = (await db.execute(
-            select(RawPost).where(RawPost.id.in_(missing_ids))
-        )).scalars().all()
-
-        for raw in missing_raw:
-            text = f"{raw.title} {raw.content}".strip() or raw.title
-            try:
-                vec = embedder.encode(text)  # list[float] of dim 384
-                emb = PostEmbedding(
-                    raw_post_id=raw.id,
-                    embedded_text=text[:2000],  # truncate for storage
-                    embedding=vec,
-                    model_name=settings.EMBEDDING_MODEL_NAME,
-                )
-                db.add(emb)
-                emb_by_raw[raw.id] = emb
-            except Exception as e:
-                logger.warning("Embedding failed for raw_post %s: %s", raw.id, e)
-        await db.commit()
-
-    # ── Load projects (for profile embeddings) ──────────────────────────────
+    # ── Load projects (for profile text + thresholds) ────────────────────────
     project_ids = list({mp.project_id for mp in matched_posts})
     projects = (await db.execute(
         select(Project).where(Project.id.in_(project_ids))
     )).scalars().all()
     project_by_id = {p.id: p for p in projects}
 
-    # Cache project profile embeddings in-memory (per-run)
-    project_profile_emb: dict[uuid.UUID, list[float]] = {}
+    # ── Resolve the embedding provider ──────────────────────────────────────
+    from app.ai.embeddings import get_embedder, similarity_for_posts
+    from app.ai.lexical import lexical_similarity
 
+    embedder = get_embedder()
+
+    # ── Load existing embeddings (cache hit) ────────────────────────────────
+    raw_post_ids = list({mp.raw_post_id for mp in matched_posts})
+    existing_embs = (await db.execute(
+        select(PostEmbedding).where(PostEmbedding.raw_post_id.in_(raw_post_ids))
+    )).scalars().all()
+    emb_by_raw = {e.raw_post_id: e for e in existing_embs}
+
+    # ── Compute embeddings for raw posts that lack one ──────────────────────
+    embeddings_computed = 0
+    if embedder is not None:
+        missing_ids = [pid for pid in raw_post_ids if pid not in emb_by_raw]
+        if missing_ids:
+            missing_raw = (await db.execute(
+                select(RawPost).where(RawPost.id.in_(missing_ids))
+            )).scalars().all()
+
+            for raw in missing_raw:
+                text = f"{raw.title} {raw.content}".strip() or raw.title
+                try:
+                    vec = embedder.encode(text)
+                    emb = PostEmbedding(
+                        raw_post_id=raw.id,
+                        embedded_text=text[:2000],
+                        embedding=vec,
+                        model_name=embedder.model,
+                    )
+                    db.add(emb)
+                    emb_by_raw[raw.id] = emb
+                    embeddings_computed += 1
+                except Exception as e:
+                    logger.warning("Embedding failed for raw_post %s: %s", raw.id, e)
+            if embeddings_computed:
+                await db.commit()
+
+    # ── Project profile embeddings (per product, cached per run) ────────────
+    project_profile_emb: dict[uuid.UUID, list[float]] = {}
+    if embedder is not None:
+        for project in projects:
+            profile_text = _profile_text(project)
+            if profile_text:
+                try:
+                    project_profile_emb[project.id] = embedder.encode(profile_text)
+                except Exception as e:
+                    logger.warning("Profile embedding failed for project %s: %s", project.id, e)
+
+    # ── SQL-side similarity via pgvector when available ──────────────────────
+    sim_by_project: dict[uuid.UUID, dict[uuid.UUID, float]] = {}
+    for pid, profile_vec in project_profile_emb.items():
+        posts_for_project = [mp.raw_post_id for mp in matched_posts if mp.project_id == pid]
+        try:
+            sim_by_project[pid] = await similarity_for_posts(db, posts_for_project, profile_vec)
+        except Exception as e:
+            logger.warning("pgvector similarity failed for project %s: %s", pid, e)
+            sim_by_project[pid] = {}
+
+    # ── Score each matched post ─────────────────────────────────────────────
     scored = 0
     above_threshold = 0
-    embeddings_computed = len(missing_ids)
+
+    # Keyword-match counts per (raw_post, project) — feeds the keyword signal
+    match_counts = await _match_counts(db, matched_posts)
 
     for mp in matched_posts:
-        post_emb = emb_by_raw.get(mp.raw_post_id)
-        if not post_emb:
-            continue  # embedding failed earlier
-
         project = project_by_id.get(mp.project_id)
         if not project:
             continue
 
-        # Get or compute project profile embedding
-        if mp.project_id not in project_profile_emb:
-            profile_text = " ".join(filter(None, [
-                project.goal_description,
-                project.company_name,
-                project.company_description,
-            ])).strip()
-            if profile_text:
-                try:
-                    project_profile_emb[mp.project_id] = embedder.encode(profile_text)
-                except Exception:
-                    project_profile_emb[mp.project_id] = []
-            else:
-                project_profile_emb[mp.project_id] = []
-
-        # ── Compute cosine similarity ──────────────────────────────────────
-        profile_vec = project_profile_emb.get(mp.project_id, [])
-        similarity = 0.0
-        if profile_vec:
-            similarity = _cosine_sim(post_emb.embedding, profile_vec)
-
-        # ── Apply intent-phrase boost ──────────────────────────────────────
         text = f"{mp.title} {mp.content}".lower()
-        intent_phrase = ""
-        phrase_boost = 0.0
-        for phrase in INTENT_PHRASES:
-            if phrase in text:
-                intent_phrase = phrase
-                phrase_boost = INTENT_PHRASE_BOOST
-                break
 
-        # ── Apply brand mention boost ──────────────────────────────────────
-        brand_boost = BRAND_MENTION_BOOST if mp.is_brand_mention else 0.0
+        # 1) Semantic signal — pgvector/OpenAI/lexical, always continuous
+        semantic = sim_by_project.get(mp.project_id, {}).get(mp.raw_post_id)
+        if semantic is None:
+            if embedder is not None and mp.raw_post_id in emb_by_raw and project.id in project_profile_emb:
+                from app.ai.embeddings import cosine_similarity, calibrate_similarity
+                raw_sim = cosine_similarity(
+                    emb_by_raw[mp.raw_post_id].embedding,
+                    project_profile_emb[project.id],
+                )
+                semantic = calibrate_similarity(raw_sim)
+            else:
+                # Lexical fallback — continuous, deterministic, no deps
+                semantic = lexical_similarity(
+                    f"{mp.title} {mp.content}",
+                    _profile_text(project),
+                )
 
-        # ── Final score (clamped 0.0–1.0) ──────────────────────────────────
-        # Weighting: 50% semantic similarity, 50% heuristics
-        final_score = min(1.0, (similarity * 0.5) + (BASE_KEYWORD_SCORE + phrase_boost + brand_boost) * 0.5)
+        # 2) Intent-phrase signal (weighted, word-boundary)
+        intent, best_phrase = intent_signal(text)
 
-        mp.intent_score = round(final_score, 4)
-        mp.matched_intent_phrase = intent_phrase
+        # 3) Keyword + brand signals
+        kw_count = match_counts.get((mp.raw_post_id, mp.project_id), 1)
+        brand = bool(mp.is_brand_mention)
+
+        # 4) Final continuous score
+        final_score = compute_intent_score(
+            semantic=semantic,
+            intent=intent,
+            keyword=keyword_signal(kw_count),
+            brand=brand,
+        )
+
+        mp.semantic_score = round(max(0.0, min(1.0, semantic)), 4)
+        mp.intent_score = final_score
+        mp.matched_intent_phrase = best_phrase
 
         if final_score >= (project.llm_threshold or 0.7):
             above_threshold += 1
@@ -405,92 +511,73 @@ async def run_stage2_semantic_score(
     )
 
 
-async def _stage2_phrase_only_fallback(db: AsyncSession, matched_posts: list[MatchedPost]) -> SemanticScoreResult:
-    """Used when no embedding model is configured. Scores based purely
-    on intent phrases and brand mentions — cruder but functional.
-    Lets the MVP run without sentence-transformers installed."""
-    scored = 0
-    above_threshold = 0
-
-    # Group by project to get thresholds
-    project_ids = list({mp.project_id for mp in matched_posts})
-    projects = (await db.execute(
-        select(Project).where(Project.id.in_(project_ids))
-    )).scalars().all()
-    project_by_id = {p.id: p for p in projects}
-
-    for mp in matched_posts:
-        project = project_by_id.get(mp.project_id)
-        if not project:
-            continue
-
-        text = f"{mp.title} {mp.content}".lower()
-        intent_phrase = ""
-        phrase_boost = 0.0
-        for phrase in INTENT_PHRASES:
-            if phrase in text:
-                intent_phrase = phrase
-                phrase_boost = INTENT_PHRASE_BOOST
-                break
-
-        brand_boost = BRAND_MENTION_BOOST if mp.is_brand_mention else 0.0
-        final_score = min(1.0, BASE_KEYWORD_SCORE + phrase_boost + brand_boost)
-
-        mp.intent_score = round(final_score, 4)
-        mp.matched_intent_phrase = intent_phrase
-
-        if final_score >= (project.llm_threshold or 0.7):
-            above_threshold += 1
-        scored += 1
-
-    await db.commit()
-
-    return SemanticScoreResult(
-        matched_posts_scored=scored,
-        embeddings_computed=0,
-        posts_above_threshold=above_threshold,
-    )
+def _profile_text(project: Project) -> str:
+    """The product profile used for semantic matching — the user's goals,
+    company info and site define what 'relevant' means. Per-product by design
+    so each product's posts are scored against its own profile."""
+    return " ".join(filter(None, [
+        project.goal_description,
+        project.company_name,
+        project.company_description,
+        project.company_url,
+    ])).strip()
 
 
-def _cosine_sim(a: list[float], b: list[float]) -> float:
-    """Cosine similarity between two equal-length vectors."""
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    mag_a = sum(x * x for x in a) ** 0.5
-    mag_b = sum(x * x for x in b) ** 0.5
-    if mag_a == 0 or mag_b == 0:
-        return 0.0
-    return dot / (mag_a * mag_b)
-
-
-# Lazy-loaded embedder — only imported if Stage 2 actually runs
-_embedder = None
-def _get_embedder():
-    global _embedder
-    if _embedder is not None:
-        return _embedder
-    if not settings.EMBEDDING_MODEL_ENABLED:
-        return None
-    try:
-        from sentence_transformers import SentenceTransformer
-        _embedder = SentenceTransformer(settings.EMBEDDING_MODEL_NAME)
-        logger.info("Loaded embedding model: %s", settings.EMBEDDING_MODEL_NAME)
-        return _embedder
-    except ImportError:
-        logger.warning(
-            "sentence-transformers not installed — Stage 2 falls back to phrase-only scoring. "
-            "Install with: pip install sentence-transformers"
+async def _profile_text_with_keywords(db: AsyncSession, project: Project) -> str:
+    base = _profile_text(project)
+    kws = (await db.execute(
+        select(Keyword.keyword).where(
+            and_(
+                Keyword.project_id == project.id,
+                Keyword.keyword_type.in_(["include", "brand"]),
+            )
         )
-        return None
-    except Exception as e:
-        logger.warning("Failed to load embedding model: %s", e)
-        return None
+    )).scalars().all()
+    if kws:
+        return f"{base} topics: {', '.join(kws[:40])}".strip()
+    return base
+
+
+async def _match_counts(
+    db: AsyncSession, matched_posts: list[MatchedPost]
+) -> dict[tuple[uuid.UUID, uuid.UUID], int]:
+    """KeywordMatch counts for each (raw_post, project) pair."""
+    pairs = list({(mp.raw_post_id, mp.project_id) for mp in matched_posts})
+    if not pairs:
+        return {}
+    # One query grouped by (raw_post, project)
+    rows = (await db.execute(
+        select(
+            KeywordMatch.raw_post_id,
+            KeywordMatch.project_id,
+            func.count(KeywordMatch.id),
+        ).where(
+            sa_tuple(KeywordMatch.raw_post_id, KeywordMatch.project_id).in_(pairs)
+        ).group_by(KeywordMatch.raw_post_id, KeywordMatch.project_id)
+    )).all()
+    return {(r[0], r[1]): int(r[2]) for r in rows}
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STAGE 3: LLM Filter
+# STAGE 3: LLM Filter — the Lead Agent
 # ═════════════════════════════════════════════════════════════════════════════
+
+# Candidate floor for Stage 3 — posts below this never merit an LLM call
+# (the agent's cost-control router enforces the per-project threshold on top)
+STAGE3_CANDIDATE_FLOOR = 0.55
+
+
+def _no_llm_auto_promote_threshold(embedder_active: bool) -> float:
+    """Auto-promotion bar when no LLM is configured.
+
+    With embeddings active, Stage-2 scores span the full 0..1 range, so the
+    classic 0.85 bar stands. With the lexical fallback, scores are compressed
+    (semantic rarely exceeds ~0.55), so the bar scales down to 0.65 — keeping
+    the no-key dev experience functional without over-promoting noise.
+    """
+    return 0.85 if embedder_active else 0.65
+
 
 async def run_stage3_llm_filter(
     db: AsyncSession,
@@ -498,84 +585,164 @@ async def run_stage3_llm_filter(
     score_override: float | None = None,
 ) -> LLMFilterResult:
     """
-    For each MatchedPost where:
-        intent_score >= project.llm_threshold
-        AND is_processed_to_lead == False
-      Send to LLM with project context.
-      If LLM confirms high intent → create Lead.
-      Mark is_processed_to_lead=True either way.
+    Runs the lead-grading agent (LangGraph when installed, sequential
+    fallback otherwise) on unprocessed MatchedPosts that cleared Stage 2
+    meaningfully (intent >= STAGE3_CANDIDATE_FLOOR).
+
+    LLM path:      posts below the project's llm_threshold are skipped and
+                   stay unprocessed (retried if the threshold is lowered or
+                   a rescore raises their score — fixes the old behavior where
+                   borderline posts were permanently skipped without ever
+                   seeing an LLM).
+    No-LLM path:   posts at/above the adaptive auto-promotion bar become
+                   leads deterministically; weaker posts stay unprocessed so
+                   they get agent-graded the moment an LLM is configured.
     """
-    # Load candidates
+    # Candidates: anything below the floor is never worth a re-look
     stmt = (
-        select(MatchedPost)
-        .where(MatchedPost.is_processed_to_lead == False)
+        select(MatchedPost, Project)
+        .join(Project, MatchedPost.project_id == Project.id)
+        .where(
+            and_(
+                MatchedPost.is_processed_to_lead == False,  # noqa: E712
+                MatchedPost.intent_score >= STAGE3_CANDIDATE_FLOOR,
+            )
+        )
         .order_by(MatchedPost.intent_score.desc())
         .limit(limit)
     )
-    candidates = (await db.execute(stmt)).scalars().all()
 
-    if not candidates:
+    rows = (await db.execute(stmt)).all()
+    if not rows:
         return LLMFilterResult(
             matched_posts_processed=0,
             leads_created=0,
             llm_errors=0,
         )
 
-    # Load projects
-    project_ids = list({mp.project_id for mp in candidates})
-    projects = (await db.execute(
-        select(Project).where(Project.id.in_(project_ids))
-    )).scalars().all()
-    project_by_id = {p.id: p for p in projects}
+    from app.ai.lead_agent import run_lead_agent
+    from app.integrations import service as integrations_service
 
-    # ── Lazy LLM client ─────────────────────────────────────────────────────
-    llm_client = _get_llm_client()
-    if llm_client is None:
-        # No LLM configured — auto-promote high-score posts to Leads
-        return await _stage3_no_llm_fallback(db, candidates, project_by_id)
+    # Whether any embedding provider is active — sets the no-LLM auto-promote bar
+    try:
+        from app.ai.embeddings import get_embedder
+        embedder_active = get_embedder() is not None
+    except Exception:
+        embedder_active = False
 
     processed = 0
     leads_created = 0
     errors = 0
 
-    for mp in candidates:
-        project = project_by_id.get(mp.project_id)
-        if not project:
-            continue
+    # Cache: keywords per project + BYO-LLM config per owner (1 query each)
+    keywords_by_project: dict[uuid.UUID, list[str]] = {}
+    llm_config_cache: dict[uuid.UUID, dict | None] = {}
 
-        # Skip if below threshold (unless override is set)
+    for mp, project in rows:
         threshold = score_override if score_override is not None else (project.llm_threshold or 0.7)
-        if mp.intent_score < threshold:
-            mp.is_processed_to_lead = True  # mark so we don't re-check
-            continue
 
-        # ── Call LLM ────────────────────────────────────────────────────────
+        # ── Keywords for context (cached) ────────────────────────────────
+        if project.id not in keywords_by_project:
+            keywords_by_project[project.id] = (await db.execute(
+                select(Keyword.keyword).where(
+                    and_(
+                        Keyword.project_id == project.id,
+                        Keyword.keyword_type.in_(["include", "brand"]),
+                    )
+                )
+            )).scalars().all()
+
+        # ── BYO-LLM config for this project's owner (cached) ──────────────
+        if project.owner_id not in llm_config_cache:
+            try:
+                llm_config_cache[project.owner_id] = await integrations_service.get_user_llm_config(
+                    db, project.owner_id
+                )
+            except Exception as e:
+                logger.warning("BYO-LLM lookup failed for user %s: %s", project.owner_id, e)
+                llm_config_cache[project.owner_id] = None
+
+        llm_config = llm_config_cache.get(project.owner_id)
+        llm_available = bool((llm_config or {}).get("api_key") or settings.llm_enabled)
+
         try:
-            is_lead, reason = await llm_client.classify_lead(
-                project=project,
-                post=mp,
-            )
+            if not llm_available:
+                # ── No LLM configured — deterministic auto-promotion ─────────
+                auto_promote = _no_llm_auto_promote_threshold(embedder_active)
+                if mp.intent_score >= min(auto_promote, threshold):
+                    lead = Lead(
+                        project_id=project.id,
+                        matched_post_id=mp.id,
+                        status=LeadStatus.NEW.value,
+                        intent_score=mp.intent_score,
+                        url=mp.url,
+                        matched_keyword=mp.matched_keyword,
+                        llm_reason="High-score auto-promotion (no LLM configured — set OPENAI_API_KEY or connect a custom LLM in Integrations to enable agent grading)",
+                    )
+                    db.add(lead)
+                    mp.is_lead = True
+                    mp.llm_score = None
+                    leads_created += 1
+                    await _notify_lead(db, project, mp)
+                    mp.is_processed_to_lead = True
+                # Weaker posts stay unprocessed so the lead agent grades
+                # them as soon as an LLM becomes available.
+                processed += 1
+                continue
+
+            # ── Run the lead agent ────────────────────────────────────────
+            if score_override is None and mp.intent_score < threshold:
+                # Below the project's LLM threshold — leave unprocessed; the
+                # agent will grade it if the threshold is lowered later.
+                continue
+
+            state = {
+                "project_id": str(project.id),
+                "project_name": project.name,
+                "goal_description": project.goal_description or "",
+                "goal_type": project.goal_type or "",
+                "company_name": project.company_name or "",
+                "company_description": project.company_description or "",
+                "keywords": keywords_by_project.get(project.id, []),
+                "llm_threshold": float(threshold),
+                "post_id": str(mp.id),
+                "post_title": mp.title or "",
+                "post_content": mp.content or "",
+                "post_author": mp.author or "",
+                "post_subreddit": mp.subreddit or "",
+                "matched_keyword": mp.matched_keyword or "",
+                "matched_snippet": mp.matched_snippet or "",
+                "semantic_score": mp.semantic_score,
+            }
+            result = await run_lead_agent(state, llm_config=llm_config)
             processed += 1
+
+            is_lead = bool(result.get("is_lead"))
+            confidence = float(result.get("confidence", 0.5))
+            reason = str(result.get("reason", ""))[:1000]
+            final_score = float(result.get("final_score", mp.intent_score))
+
+            mp.llm_score = round(max(0.0, min(1.0, confidence)), 4)
+            mp.is_processed_to_lead = True
 
             if is_lead:
                 lead = Lead(
                     project_id=project.id,
                     matched_post_id=mp.id,
                     status=LeadStatus.NEW.value,
-                    intent_score=mp.intent_score,
+                    intent_score=round(final_score, 4),
                     url=mp.url,
                     matched_keyword=mp.matched_keyword,
-                    llm_reason=reason,
+                    llm_reason=reason or "Lead agent confirmed buying intent",
                 )
                 db.add(lead)
                 mp.is_lead = True
-                mp.is_processed_to_lead = True
+                mp.intent_score = round(final_score, 4)  # agent-blended final score
                 leads_created += 1
-            else:
-                mp.is_processed_to_lead = True
+                await _notify_lead(db, project, mp)
 
         except Exception as e:
-            logger.warning("LLM error on matched_post %s: %s", mp.id, e)
+            logger.warning("Lead agent error on matched_post %s: %s", mp.id, e)
             errors += 1
             # Don't mark as processed — we'll retry next batch
             continue
@@ -589,17 +756,35 @@ async def run_stage3_llm_filter(
     )
 
 
+async def _notify_lead(db: AsyncSession, project: Project, mp: MatchedPost) -> None:
+    """Best-effort fan-out of a new lead to the owner's integrations.
+    Never raises into the pipeline."""
+    try:
+        from app.integrations import service as integrations_service
+        await integrations_service.notify_new_lead(
+            db,
+            owner_id=project.owner_id,
+            product_name=project.name,
+            lead_intent_score=mp.intent_score,
+            matched_keyword=mp.matched_keyword,
+            url=mp.url,
+            title=mp.title,
+            reason="",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Lead alert fan-out failed for project %s: %s", project.id, e)
+
+
+# Legacy fallback entry point kept for API compatibility (unused now —
+# no-LLM behavior is handled inline in run_stage3_llm_filter)
 async def _stage3_no_llm_fallback(
     db: AsyncSession,
     candidates: list[MatchedPost],
     projects: dict,
 ) -> LLMFilterResult:
-    """When no LLM is configured, auto-promote posts above 0.85 to Leads
-    with reason='high-score bypass (no LLM)'. Lets the MVP run end-to-end
-    without an OpenAI key."""
+    """When no LLM is configured, auto-promote posts above 0.85 to Leads."""
     promoted = 0
     processed = 0
-    HIGH_SCORE_AUTO_PROMOTE = 0.85
 
     for mp in candidates:
         project = projects.get(mp.project_id)
@@ -607,7 +792,6 @@ async def _stage3_no_llm_fallback(
             continue
         threshold = project.llm_threshold or 0.7
         if mp.intent_score < threshold:
-            mp.is_processed_to_lead = True
             continue
         processed += 1
         if mp.intent_score >= HIGH_SCORE_AUTO_PROMOTE:
@@ -631,23 +815,6 @@ async def _stage3_no_llm_fallback(
         leads_created=promoted,
         llm_errors=0,
     )
-
-
-# Lazy LLM client
-_llm_client = None
-def _get_llm_client():
-    global _llm_client
-    if _llm_client is not None:
-        return _llm_client
-    if not settings.LLM_ENABLED:
-        return None
-    try:
-        from app.matching.llm_client import LLMLeadClassifier
-        _llm_client = LLMLeadClassifier()
-        return _llm_client
-    except Exception as e:
-        logger.warning("Failed to init LLM client: %s", e)
-        return None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
