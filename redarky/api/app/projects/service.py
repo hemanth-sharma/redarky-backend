@@ -47,7 +47,11 @@ async def get_project(db: AsyncSession, project_id: UUID, owner_id: UUID) -> Pro
 
 
 async def create_project(db: AsyncSession, project_in: ProjectCreate, owner_id: UUID) -> Project:
-    project = Project(**project_in.model_dump(), owner_id=owner_id)
+    data = project_in.model_dump()
+    # Never let an empty/invalid platforms list through — default to reddit
+    if not data.get("platforms"):
+        data["platforms"] = ["reddit"]
+    project = Project(**data, owner_id=owner_id)
     db.add(project)
     await db.commit()
     await db.refresh(project)
@@ -58,6 +62,8 @@ async def update_project(
     db: AsyncSession, project: Project, project_in: ProjectUpdate
 ) -> Project:
     for field, value in project_in.model_dump(exclude_unset=True).items():
+        if field == "platforms" and not value:
+            value = ["reddit"]
         setattr(project, field, value)
     await db.commit()
     await db.refresh(project)
@@ -87,7 +93,9 @@ async def deactivate_pipeline(db: AsyncSession, project: Project) -> Project:
 
 # ── Dashboard stats ──────────────────────────────────────────────────────────
 async def get_project_stats(db: AsyncSession, project: Project) -> ProjectStats:
-    """Aggregated counts for the project dashboard."""
+    """Aggregated counts for the project dashboard — matched posts, leads,
+    unactioned leads, active keywords/sources, plus the 3-stage funnel
+    breakdown (semantic-scored, LLM-checked) for transparency."""
     project_id = project.id
 
     matched_count = await db.scalar(
@@ -109,10 +117,29 @@ async def get_project_stats(db: AsyncSession, project: Project) -> ProjectStats:
         select(func.count(ProjectSource.id)).where(ProjectSource.project_id == project_id)
     )
 
+    # 3-stage funnel transparency
+    semantic_scored = await db.scalar(
+        select(func.count(MatchedPost.id)).where(
+            MatchedPost.project_id == project_id,
+            MatchedPost.semantic_score.isnot(None),
+        )
+    )
+    llm_checked = await db.scalar(
+        select(func.count(MatchedPost.id)).where(
+            MatchedPost.project_id == project_id,
+            MatchedPost.is_processed_to_lead == True,  # noqa: E712
+        )
+    )
+    avg_intent = await db.scalar(
+        select(func.avg(MatchedPost.intent_score)).where(MatchedPost.project_id == project_id)
+    )
+    last_activity = await db.scalar(
+        select(func.max(MatchedPost.created_at)).where(MatchedPost.project_id == project_id)
+    )
+
     # Last scraper run that touched this project's keywords/sources.
-    # For MVP, just grab the most recent successful run globally — proper
-    # per-project tracking would require joining payload_sent against
-    # project keywords, which is overkill for MVP.
+    # For MVP, the most recent successful run globally — proper per-project
+    # tracking would require joining payload_sent against project keywords.
     last_run = await db.scalar(
         select(func.max(ScraperRun.started_at)).where(ScraperRun.status == "success")
     )
@@ -125,4 +152,8 @@ async def get_project_stats(db: AsyncSession, project: Project) -> ProjectStats:
         active_keywords_count=int(active_keywords or 0),
         active_sources_count=int(active_sources or 0),
         last_scraper_run_at=last_run,
+        semantic_scored_count=int(semantic_scored or 0),
+        llm_checked_count=int(llm_checked or 0),
+        avg_intent_score=round(float(avg_intent), 4) if avg_intent is not None else None,
+        last_activity_at=last_activity,
     )

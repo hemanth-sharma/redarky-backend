@@ -14,8 +14,8 @@ This is the single source of truth for "what is this user trying to do".
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, func, JSON
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -54,6 +54,15 @@ class Project(Base):
     # Threshold above which a MatchedPost is sent to the LLM (Stage 3).
     # Default 0.7 — tune as you gather data.
     llm_threshold: Mapped[float] = mapped_column(default=0.7, nullable=False)
+
+    # Which data platforms this product's pipeline pulls from.
+    # Supported today: "reddit". Others (hacker_news, x, linkedin, ...) can be
+    # enabled per product as their collectors come online — the scraper
+    # payload builder respects this list when aggregating the shared batch.
+    platforms: Mapped[list] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        default=lambda: ["reddit"], nullable=False, server_default='["reddit"]',
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

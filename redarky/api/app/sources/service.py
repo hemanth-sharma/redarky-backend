@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, cast, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import MonitoredSource, ProjectSource
@@ -158,21 +158,38 @@ async def get_project_sources(db: AsyncSession, project_id: UUID) -> list[Monito
 
 
 # ── Scraper-facing: get all active sources for shared batch ──────────────────
-async def get_active_sources_for_scraper(db: AsyncSession) -> list[MonitoredSource]:
+async def get_active_sources_for_scraper(db: AsyncSession, platform: str | None = None) -> list[MonitoredSource]:
     """
     Returns all MonitoredSource rows where is_active=True.
     Used by the scraper service to build the shared Go scraper payload.
 
+    Platform-aware: when `platform` is given, only sources of that type
+    linked to active projects that include the platform in their
+    `platforms` config are returned (per-product platform selection).
+
     Each row is included ONCE per batch — multiple projects watching the
     same subreddit share the same scrape.
     """
+    from app.models import Project
+
     stmt = (
         select(MonitoredSource)
-        .where(MonitoredSource.is_active == True)
-        .order_by(MonitoredSource.last_scraped_at.asc().nullsfirst())
+        .join(ProjectSource, ProjectSource.monitored_source_id == MonitoredSource.id)
+        .join(Project, Project.id == ProjectSource.project_id)
+        .where(
+            MonitoredSource.is_active == True,  # noqa: E712
+            Project.is_pipeline_active == True,  # noqa: E712
+        )
     )
+    if platform:
+        stmt = stmt.where(
+            (MonitoredSource.source_type == platform)
+            & cast(Project.platforms, String).ilike(f'%"{platform}"%')
+        )
+    stmt = stmt.distinct().order_by(MonitoredSource.last_scraped_at.asc().nullsfirst())
+
     result = await db.execute(stmt)
-    return list(result.scalars().all())
+    return list(result.scalars().unique().all())
 
 
 async def mark_source_scraped(db: AsyncSession, source_id: UUID) -> None:

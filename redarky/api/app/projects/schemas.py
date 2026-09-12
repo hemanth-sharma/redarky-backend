@@ -2,7 +2,7 @@
 app/projects/schemas.py
 """
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,6 +28,10 @@ class ProjectCreate(BaseModel):
     company_name: Optional[str] = None
     company_url: Optional[str] = None
     company_description: Optional[str] = None
+
+    # Platforms this product's pipeline pulls data from ("reddit" today;
+    # more as collectors come online)
+    platforms: Optional[List[str]] = None
 
     # Default retention: 30 days. Frontend lets user pick 5 / 10 / 30.
     data_retention_days: int = Field(default=30, ge=1, le=90)
@@ -65,6 +69,7 @@ class ProjectResponse(BaseModel):
     company_name: Optional[str] = None
     company_url: Optional[str] = None
     company_description: Optional[str] = None
+    platforms: List[str] = ["reddit"]
     is_pipeline_active: bool
     pipeline_activated_at: Optional[datetime] = None
     data_retention_days: int
@@ -82,3 +87,8 @@ class ProjectStats(BaseModel):
     active_keywords_count: int
     active_sources_count: int
     last_scraper_run_at: Optional[datetime] = None
+    # 3-stage funnel transparency
+    semantic_scored_count: int = 0
+    llm_checked_count: int = 0
+    avg_intent_score: Optional[float] = None
+    last_activity_at: Optional[datetime] = None
