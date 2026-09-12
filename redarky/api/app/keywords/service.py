@@ -72,19 +72,25 @@ async def get_active_include_keywords(db: AsyncSession, platform: str | None = N
     during Stage 1 matching, not sent to the scraper).
     """
     from app.models import Project
+
+    conditions = [
+        Project.is_pipeline_active == True,
+        Keyword.keyword_type.in_([
+            KeywordType.INCLUDE.value,
+            KeywordType.BRAND.value,
+        ]),
+    ]
+    
+    platform_cond = _platform_filter(platform)
+    if platform_cond is not None:
+        conditions.append(platform_cond)
+
     stmt = (
         select(Keyword.keyword)
         .distinct()
         .select_from(Keyword)
         .join(Project, Keyword.project_id == Project.id)
-        .where(
-            Project.is_pipeline_active == True,
-            Keyword.keyword_type.in_([
-                KeywordType.INCLUDE.value,
-                KeywordType.BRAND.value,
-            ]),
-            *(_platform_filter(platform),)
-        )
+        .where(*conditions)
     )
     result = await db.execute(stmt)
     return [r[0] for r in result.fetchall()]
@@ -94,9 +100,9 @@ def _platform_filter(platform: str | None):
     """SQLAlchemy criterion limiting to projects that pull from `platform`.
     JSON containment compared via text cast so it works on both Postgres
     JSONB and SQLite JSON."""
-    from sqlalchemy import or_, cast, String
-    from app.models import Project
     if not platform:
-        from sqlalchemy import text as sa_text
-        return [sa_text("1=1")]
-    return [cast(Project.platforms, String).ilike(f'%"{platform}"%')]
+        return None
+        
+    from sqlalchemy import cast, String
+    from app.models import Project
+    return cast(Project.platforms, String).ilike(f'%"{platform}"%')
