@@ -48,8 +48,9 @@ async def get_leads(
 
     total = await db.scalar(count_base) or 0
 
+    # Highest-intent first — the queue shows the strongest leads on top
     offset = (page - 1) * page_size
-    base = base.order_by(Lead.created_at.desc()).offset(offset).limit(page_size)
+    base = base.order_by(Lead.intent_score.desc(), Lead.created_at.desc()).offset(offset).limit(page_size)
     result = await db.execute(base)
     return list(result.scalars().all()), int(total)
 

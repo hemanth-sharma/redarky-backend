@@ -111,3 +111,8 @@ class ScraperRunResponse(BaseModel):
     payload_sent: dict
     error_message: Optional[str] = None
     created_at: datetime
+
+    # Pipeline-relevant counts — how many of this run's ingested posts
+    # became keyword matches / leads (attached by the service layer)
+    matched_posts_count: int = 0
+    leads_created_count: int = 0

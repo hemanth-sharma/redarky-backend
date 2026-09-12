@@ -62,13 +62,16 @@ async def run_scraper(
 
 @router.get("/runs", response_model=list[ScraperRunResponse])
 async def list_scraper_runs(
-    limit: int = 50,
+    limit: int = 20,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Lists recent scraper runs — for debugging "why am I not getting leads?".
-    Returns the most recent `limit` runs globally (admin-style view for MVP)."""
-    return await scraper_service.list_scraper_runs(db=db, limit=limit)
+    """Lists recent pipeline runs with per-run matched-post and lead counts.
+    `limit` is clamped server-side to 1..50 so a stray large value can never
+    flood the client with historical rows."""
+    return await scraper_service.list_scraper_runs(
+        db=db, limit=limit, with_matched_counts=True
+    )
 
 
 @router.get("/runs/{run_id}", response_model=ScraperRunResponse)

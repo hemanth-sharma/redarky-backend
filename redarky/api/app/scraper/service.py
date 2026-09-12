@@ -41,9 +41,13 @@ async def build_shared_payload(db: AsyncSession) -> ScraperPayload:
               sent to Go ONCE).
     Subreddits: each active MonitoredSource row is one entry, regardless
                 of how many projects share it.
+
+    Platform-aware: only projects that have "reddit" in their platforms
+    contribute keywords/sources to the Reddit batch. When more platform
+    collectors come online, each gets its own payload builder section.
     """
-    keywords = await get_active_include_keywords(db)
-    sources = await get_active_sources_for_scraper(db)
+    keywords = await get_active_include_keywords(db, platform="reddit")
+    sources = await get_active_sources_for_scraper(db, platform="reddit")
 
     # Reddit subreddits only for now — other source types will need
     # their own payload shape later.
@@ -180,9 +184,49 @@ async def get_scraper_run(db: AsyncSession, run_id) -> ScraperRun:
     return run
 
 
-async def list_scraper_runs(db: AsyncSession, limit: int = 50) -> list[ScraperRun]:
+async def list_scraper_runs(
+    db: AsyncSession,
+    limit: int = 20,
+    with_matched_counts: bool = False,
+) -> list[ScraperRun]:
+    """Most recent runs first. `limit` is clamped to 1..50 so a stray
+    query param can never pull the whole table (frontend refresh bug)."""
     from sqlalchemy import select
+    limit = max(1, min(int(limit or 20), 50))
     result = await db.execute(
         select(ScraperRun).order_by(ScraperRun.started_at.desc()).limit(limit)
     )
-    return list(result.scalars().all())
+    runs = list(result.scalars().all())
+
+    if with_matched_counts and runs:
+        await _attach_matched_counts(db, runs)
+    return runs
+
+
+async def _attach_matched_counts(db: AsyncSession, runs: list[ScraperRun]) -> None:
+    """Enriches each run with pipeline-relevant counts: how many of the
+    posts it ingested became keyword matches and how many became leads.
+    Joins raw_posts.scraper_run_id → matched_posts / leads in one query
+    per table, then stashes on the ORM objects (non-column attrs).
+    """
+    from sqlalchemy import select, func, case
+    from app.models import MatchedPost, Lead, RawPost
+
+    run_ids = [r.id for r in runs]
+
+    matched_rows = (await db.execute(
+        select(
+            RawPost.scraper_run_id,
+            func.count(func.distinct(MatchedPost.id)),
+            func.count(func.distinct(case((MatchedPost.is_lead == True, MatchedPost.id)))),  # noqa: E712
+        )
+        .join(MatchedPost, MatchedPost.raw_post_id == RawPost.id)
+        .where(RawPost.scraper_run_id.in_(run_ids))
+        .group_by(RawPost.scraper_run_id)
+    )).all()
+    matched_by_run = {row[0]: (int(row[1] or 0), int(row[2] or 0)) for row in matched_rows}
+
+    for run in runs:
+        matched, leads = matched_by_run.get(run.id, (0, 0))
+        run._matched_posts_count = matched  # type: ignore[attr-defined]
+        run._leads_created_count = leads    # type: ignore[attr-defined]

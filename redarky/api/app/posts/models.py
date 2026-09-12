@@ -69,6 +69,12 @@ class MatchedPost(Base):
     matched_intent_phrase: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     is_brand_mention: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # ── Stage-2 semantic similarity (0.0–1.0). NULL = not yet scored ─────────
+    semantic_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # ── Stage-3 LLM confidence (0.0–1.0). NULL = not yet LLM-checked ─────────
+    llm_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # ── Stage-3 LLM tracking ─────────────────────────────────────────────────
     # Has this post been sent to the LLM yet? (prevents double-processing)
     is_processed_to_lead: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)

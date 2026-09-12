@@ -38,6 +38,10 @@ class MatchedPostResponse(BaseModel):
     matched_intent_phrase: str
     is_brand_mention: bool
 
+    # Stage breakdown (transparency for the queue/detail UI)
+    semantic_score: Optional[float] = None
+    llm_score: Optional[float] = None
+
     # Stage-3 status
     is_processed_to_lead: bool
     is_lead: bool

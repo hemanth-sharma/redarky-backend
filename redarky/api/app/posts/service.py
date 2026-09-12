@@ -74,7 +74,16 @@ async def get_matched_posts(
         "created_at": MatchedPost.created_at,
         "score": MatchedPost.score,
     }.get(filters.sort_by, MatchedPost.intent_score)
-    base = base.order_by(desc(sort_col) if filters.sort_desc else asc(sort_col))
+    # Leads ALWAYS float to the top when sorting by intent score — they passed
+    # all 3 filtering stages, so they outrank any potential match.
+    if filters.sort_by in ("intent_score", None) and filters.sort_desc:
+        base = base.order_by(
+            desc(MatchedPost.is_lead),
+            desc(sort_col),
+            desc(MatchedPost.created_at),
+        )
+    else:
+        base = base.order_by(desc(sort_col) if filters.sort_desc else asc(sort_col))
 
     # ── Paginate ────────────────────────────────────────────────────────────
     offset = (filters.page - 1) * filters.page_size

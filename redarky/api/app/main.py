@@ -23,6 +23,8 @@ from app.ingestion.router import router as ingestion_router
 from app.matching.router import router as matching_router
 from app.posts.router import router as post_router
 from app.leads.router import router as lead_router
+from app.feedback.router import router as feedback_router
+from app.integrations.router import router as integrations_router
 
 from app.workers.celery_app import celery
 
@@ -196,3 +198,5 @@ app.include_router(ingestion_router)
 app.include_router(matching_router)
 app.include_router(post_router)
 app.include_router(lead_router)
+app.include_router(feedback_router)
+app.include_router(integrations_router)
